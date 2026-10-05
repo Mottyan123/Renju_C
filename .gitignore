@@ -1,0 +1,7 @@
+.vscode/
+backup/
+test/
+.libgomoku.o
+gomoku_ai.o
+gomoku.o
+gomoku.exe

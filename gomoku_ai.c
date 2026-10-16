@@ -17,7 +17,7 @@ overview:
 - Rapfi engineのベースである単一スレッドのアルファベータ探索をＣ言語で実装
 - 推論処理と連珠用係数はsearch.cppとparameter.hを参考に実装
 - 評価状態と盤面形状の復元、候補限定の方策、64バイトの置換表を実装
-- 禁じ手対策として.libgomoku.cを参考に判定関数を実装
+- 禁じ手対策として.libgomoku_b.cの実際の判定順序と再帰判定を実装
 - 公開重みと形状表を定数配列に保持し、実行時の外部ファイルは不要
 
 @Author: Kazunori Hashimoto
@@ -542,9 +542,6 @@ overview:
 /* 実局面の履歴に探索手順と先読み分を追加できる保存容量。 */
 #define POSITION_STATE_CAPACITY (BOARD_POINT_COUNT + SEARCH_PLY_LIMIT + 8)
 
-/* ７点中の中央以外の６点を三進符号で網羅するための形状数。 */
-#define LIBRARY_PATTERN_COUNT 729
-
 /* 公開モデルの特徴次元とメモリ配置を一致させるための６４チャネル。 */
 #define NNUE_FEATURE_CHANNEL_COUNT 64
 
@@ -783,32 +780,38 @@ static int search_should_stop;
 static clock_t search_start_cpu_clock;
 
 /* 盤外参照を防ぐため、外部座標が盤面内にあるかを判定する。 */
-static int inside(int board_x, int board_y) {
+static int inside(int board_x, int board_y)
+{
     return board_x >= 0 && board_x < BOARD_SIZE && board_y >= 0 && board_y < BOARD_SIZE;
 }
 
 /* 方向ごとの移動を加減算に統一するため、座標を余白付きの３２幅盤面へ変換する。 */
-static int rpPos(int board_x, int board_y) {
+static int rpPos(int board_x, int board_y)
+{
     return ((board_y + 5) << 5) | (board_x + 5);
 }
 
 /* 公開座標との受渡しに使うため、余白付きの内部位置から横座標を戻す。 */
-static int rpX(int padded_position) {
+static int rpX(int padded_position)
+{
     return (padded_position & 31) - 5;
 }
 
 /* 公開座標との受渡しに使うため、余白付きの内部位置から縦座標を戻す。 */
-static int rpY(int padded_position) {
+static int rpY(int padded_position)
+{
     return (padded_position >> 5) - 5;
 }
 
 /* 余白の壁を着手先と誤認しないよう、内部位置が実盤面に含まれるかを判定する。 */
-static int rpInBoard(int padded_position) {
+static int rpInBoard(int padded_position)
+{
     return padded_position > 0 && padded_position < 1024 && inside(rpX(padded_position), rpY(padded_position));
 }
 
 /* 攻撃との近さを縦・横・斜めで共通に扱うため、最大座標差を距離とする。未着手は負値で区別する。 */
-static int rpDistance(int first_position, int second_position) {
+static int rpDistance(int first_position, int second_position)
+{
     int horizontal_distance, vertical_distance;
     if (first_position <= 0 || second_position <= 0) {
         return -1;
@@ -819,57 +822,68 @@ static int rpDistance(int first_position, int second_position) {
 }
 
 /* 整数の境界処理を統一するため、小さい方の値を返す。 */
-static int rpMin(int first_value, int second_value) {
+static int rpMin(int first_value, int second_value)
+{
     return first_value < second_value ? first_value : second_value;
 }
 
 /* 整数の境界処理を統一するため、大きい方の値を返す。 */
-static int rpMax(int first_value, int second_value) {
+static int rpMax(int first_value, int second_value)
+{
     return first_value > second_value ? first_value : second_value;
 }
 
 /* 小数の探索深さを保ったまま境界を扱うため、小さい方の実数を返す。 */
-static float rpMinf(float first_value, float second_value) {
+static float rpMinf(float first_value, float second_value)
+{
     return first_value < second_value ? first_value : second_value;
 }
 
 /* 小数の探索深さを保ったまま境界を扱うため、大きい方の実数を返す。 */
-static float rpMaxf(float first_value, float second_value) {
+static float rpMaxf(float first_value, float second_value)
+{
     return first_value > second_value ? first_value : second_value;
 }
 
 /* 補正量が探索深さを過度に変えないよう、実数を上下限に収める。 */
-static float rpClampf(float value_to_clamp, float lower_limit, float upper_limit) {
+static float rpClampf(float value_to_clamp, float lower_limit, float upper_limit)
+{
     return rpMaxf(lower_limit, rpMinf(upper_limit, value_to_clamp));
 }
 
 /* 実履歴と探索手数を混同しないよう、現在の履歴位置の状態を取得する。 */
-static RpState *rpState(Position *position) {
+static RpState *rpState(Position *position)
+{
     return &position->search_states[position->history_ply];
 }
 
 /* 線上の走査を盤端でも継続できるよう、範囲外を壁として扱う。 */
-static int rpPiece(const Position *position, int padded_position) {
+static int rpPiece(const Position *position, int padded_position)
+{
     return padded_position >= 0 && padded_position < 1024 ? position->board_cells[padded_position].piece : 3;
 }
 
 /* 盤外を脅威と誤認しないよう、盤面内だけの複合形状を取得する。 */
-static int rpPattern4(const Position *position, int padded_position, int player_side) {
+static int rpPattern4(const Position *position, int padded_position, int player_side)
+{
     return rpInBoard(padded_position) ? position->board_cells[padded_position].combined_patterns[player_side] : COMBINED_PATTERN_NONE;
 }
 
 /* 盤外を攻撃候補と誤認しないよう、盤面内だけの方向形状を取得する。 */
-static int rpPattern(const Position *position, int padded_position, int player_side, int direction_index) {
+static int rpPattern(const Position *position, int padded_position, int player_side, int direction_index)
+{
     return rpInBoard(padded_position) ? position->board_cells[padded_position].direction_patterns[player_side][direction_index] : LINE_PATTERN_DEAD;
 }
 
 /* 脅威の有無を盤面全走査せずに判断するため、手番別の集計を参照する。 */
-static int rpCount(Position *position, int player_side, int pattern_type) {
+static int rpCount(Position *position, int player_side, int pattern_type)
+{
     return rpState(position)->pattern_counts[player_side][pattern_type];
 }
 
 /* 近傍の参照数だけで候補を広げすぎないよう、空点と探索矩形も確認する。 */
-static int rpCandidate(Position *position, int padded_position) {
+static int rpCandidate(Position *position, int padded_position)
+{
     int board_x = rpX(padded_position), board_y = rpY(padded_position);
     RpState *current_state = rpState(position);
     return rpInBoard(padded_position) && rpPiece(position, padded_position) == 2 && position->board_cells[padded_position].candidate_reference_count && board_x >= current_state->candidate_min_x && board_x <= current_state->candidate_max_x && board_y >= current_state->candidate_min_y && board_y <= current_state->candidate_max_y;
@@ -882,7 +896,8 @@ typedef struct {
 } RpCandidateIterator;
 
 /* 着手と取消しで候補集合が食い違わないよう、参照数と石の状態からビットをそろえる。 */
-static void rpRefreshCandidate(Position *position, int padded_position) {
+static void rpRefreshCandidate(Position *position, int padded_position)
+{
     uint64_t bit_index = UINT64_C(1) << (padded_position & 63);
     if (position->board_cells[padded_position].candidate_reference_count && position->board_cells[padded_position].piece == 2) {
         position->candidate_bit_words[padded_position >> 6] |= bit_index;
@@ -893,7 +908,8 @@ static void rpRefreshCandidate(Position *position, int padded_position) {
 }
 
 /* 探索結果の再現性を保つため、ビット走査でも従来と同じ座標順で列挙する。 */
-static int rpNextCandidate(Position *position, RpCandidateIterator *candidate_iterator) {
+static int rpNextCandidate(Position *position, RpCandidateIterator *candidate_iterator)
+{
     if (!AI_ENABLE_CANDIDATE_BITS) { // 候補でない点の走査を省くためのビット集合の切替。
         while (candidate_iterator->word_index < 1024) {
             int padded_position = candidate_iterator->word_index++;
@@ -1024,18 +1040,21 @@ static const int neural_direction_y_offsets[4] = {0, 1, -1, 1};
 static const int neural_ternary_powers[12] = {1, 3, 9, 27, 81, 243, 729, 2187, 6561, 19683, 59049, 177147};
 
 /* 機種のバイト順や非整列アクセスに依存しないよう、重みの４バイトを明示的に組み立てる。 */
-static uint32_t nnueRead32(const unsigned char *source_bytes) {
+static uint32_t nnueRead32(const unsigned char *source_bytes)
+{
     return (uint32_t)source_bytes[0] | (uint32_t)source_bytes[1] << 8 | (uint32_t)source_bytes[2] << 16 | (uint32_t)source_bytes[3] << 24;
 }
 
 /* 符号変換の処理系差を避けるため、重みの２バイトを整数範囲内で組み立てる。 */
-static int16_t nnueRead16(const unsigned char *source_bytes) {
+static int16_t nnueRead16(const unsigned char *source_bytes)
+{
     unsigned value = source_bytes[0] | (unsigned)source_bytes[1] << 8;
     return (int16_t)(value < 32768 ? (int)value : (int)value - 65536);
 }
 
 /* 公開モデルの負値の丸めを保つため、負の無限大へ丸める右シフトを再現する。 */
-static int nnueShift(int value_to_shift, int shift_bit_count) {
+static int nnueShift(int value_to_shift, int shift_bit_count)
+{
     if (value_to_shift >= 0) {
         return value_to_shift >> shift_bit_count;
     }
@@ -1043,18 +1062,22 @@ static int nnueShift(int value_to_shift, int shift_bit_count) {
 }
 
 /* 移植元と同じ整数演算を得るため、１６ビットの折返しを明示する。 */
-static int16_t nnueWrap16(int value_to_wrap) {
+static int16_t nnueWrap16(int value_to_wrap)
+{
     unsigned wrapped_bits = (uint16_t)value_to_wrap;
     return (int16_t)(wrapped_bits < 32768 ? (int)wrapped_bits : (int)wrapped_bits - 65536);
 }
 
 /* 活性化と量子化で同じ飽和条件を使うため、整数を指定範囲へ収める。 */
-static int nnueClamp(int value_to_clamp, int lower_limit, int upper_limit) {
-    return value_to_clamp < lower_limit ? lower_limit : value_to_clamp > upper_limit ? upper_limit : value_to_clamp;
+static int nnueClamp(int value_to_clamp, int lower_limit, int upper_limit)
+{
+    return value_to_clamp < lower_limit ? lower_limit : value_to_clamp > upper_limit ? upper_limit
+                                                                                     : value_to_clamp;
 }
 
 /* 実行時に重みファイルを必要としないよう、埋め込み文字列から圧縮列を復元し破損を検出する。 */
-static unsigned char *nnueDecodeText(const char text[][NNUE_TEXT_CHUNK + 1], int chunk_count, size_t *decoded_size) {
+static unsigned char *nnueDecodeText(const char text[][NNUE_TEXT_CHUNK + 1], int chunk_count, size_t *decoded_size)
+{
     const char alphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     signed char decode[256];
     memset(decode, -1, sizeof(decode)); // 有効な文字以外を負値にし、破損文字を値０の符号と取り違えないようにする。
@@ -1095,7 +1118,8 @@ static unsigned char *nnueDecodeText(const char text[][NNUE_TEXT_CHUNK + 1], int
 }
 
 /* 途中で切れた圧縮列を読み越さないよう、追加の長さ情報を境界内で取得する。 */
-static int nnueReadExtendedLength(const unsigned char *input, size_t *read_offset, size_t block_end_offset, size_t *decoded_length) {
+static int nnueReadExtendedLength(const unsigned char *input, size_t *read_offset, size_t block_end_offset, size_t *decoded_length)
+{
     unsigned length_extension_byte;
     do {
         if (*read_offset >= block_end_offset) { // 破損した圧縮列による読み越しと展開先の書き越しを防ぐため、処理前に長さを制限する。
@@ -1108,7 +1132,8 @@ static int nnueReadExtendedLength(const unsigned char *input, size_t *read_offse
 }
 
 /* 失敗判定と領域解放を分離するため、圧縮ブロックだけを展開し成否を返す。 */
-static int nnueExpandBlock(const unsigned char *input, size_t block_read_start, size_t block_end_offset, unsigned frame_flags, unsigned char *output, size_t *written_byte_count) {
+static int nnueExpandBlock(const unsigned char *input, size_t block_read_start, size_t block_end_offset, unsigned frame_flags, unsigned char *output, size_t *written_byte_count)
+{
     size_t read_offset = block_read_start;
     size_t output_offset = *written_byte_count;
     size_t block_output_start = output_offset;
@@ -1152,7 +1177,8 @@ static int nnueExpandBlock(const unsigned char *input, size_t block_read_start, 
 }
 
 /* 失敗時の領域解放を一か所で保証するため、ブロック展開の成否を確認してフレームを組み立てる。 */
-static unsigned char *nnueExpandFrame(const unsigned char *input, size_t compressed_size, size_t *out_size) {
+static unsigned char *nnueExpandFrame(const unsigned char *input, size_t compressed_size, size_t *out_size)
+{
     if (compressed_size < 7 || nnueRead32(input) != 0x184d2204u || (input[4] >> 6) != 1) { // 破損した圧縮列による読み越しと展開先の書き越しを防ぐため、処理前に長さを制限する。
         return NULL;
     }
@@ -1204,7 +1230,8 @@ static unsigned char *nnueExpandFrame(const unsigned char *input, size_t compres
 }
 
 /* 公開モデルの層の並びを維持し、非整列のバイアス参照を避けるために行列とバイアスを準備する。 */
-static void nnueLoadLayer(NnueLayer *layer, const unsigned char **cursor, int inputs, int outputs) {
+static void nnueLoadLayer(NnueLayer *layer, const unsigned char **cursor, int inputs, int outputs)
+{
     layer->input_count = inputs;
     layer->output_count = outputs;
     layer->matrix_weights = (const int8_t *)*cursor;
@@ -1217,14 +1244,16 @@ static void nnueLoadLayer(NnueLayer *layer, const unsigned char **cursor, int in
 }
 
 /* 公開モデルの領域間の相互作用を再現するため、積に使う投影と出力投影を準備する。 */
-static void nnueLoadStar(NnueStar *star, const unsigned char **cursor) {
+static void nnueLoadStar(NnueStar *star, const unsigned char **cursor)
+{
     nnueLoadLayer(&star->first_projection, cursor, 64, 128); // 公開モデルの層の並びを維持し、非整列のバイアス参照を避けるために行列とバイアスを準備する。
     nnueLoadLayer(&star->second_projection, cursor, 64, 128);
     nnueLoadLayer(&star->output_projection, cursor, 64, 64);
 }
 
 /* 異なる形式のモデルを誤用しないよう形式を検査し、圧縮された特徴表と各層を展開する。 */
-static int nnueLoadWeight(NnueWeight *weight, const char text[][NNUE_TEXT_CHUNK + 1], int chunk_count) {
+static int nnueLoadWeight(NnueWeight *weight, const char text[][NNUE_TEXT_CHUNK + 1], int chunk_count)
+{
     size_t compressed_size, expanded_size;
     unsigned char *compressed = nnueDecodeText(text, chunk_count, &compressed_size);
     if (!compressed) {
@@ -1296,7 +1325,8 @@ static int nnueLoadWeight(NnueWeight *weight, const char text[][NNUE_TEXT_CHUNK 
 }
 
 /* 一手ごとに公開重みを展開し直さないよう、初回の成功・失敗を保持する。 */
-static int nnueInitialize(void) {
+static int nnueInitialize(void)
+{
     if (!neural_initialization_status) { // 毎手の準備に同じ計算を使わないよう、初期化の成否を再利用する。
         neural_initialization_status = -1;
         if (BOARD_SIZE == 15 && nnueLoadWeight(&neural_model_weights[0], nnueWeightText(0), NNUE_BLACK_CHUNKS) && nnueLoadWeight(&neural_model_weights[1], nnueWeightText(1), NNUE_WHITE_CHUNKS)) {
@@ -1314,7 +1344,8 @@ static int nnueInitialize(void) {
 }
 
 /* 盤端でも公開モデルと同じ特徴を使うため、壁までの距離を三進符号へ含める。 */
-static uint32_t nnueBorderCode(int left_visible_count, int right_visible_count) {
+static uint32_t nnueBorderCode(int left_visible_count, int right_visible_count)
+{
     int left_border_count = 5 - left_visible_count, right_border_count = 5 - right_visible_count;
     uint32_t code = 0;
     if (!left_border_count && !right_border_count) {
@@ -1346,14 +1377,16 @@ static uint32_t nnueBorderCode(int left_visible_count, int right_visible_count) 
 }
 
 /* 全盤と局所領域の特徴を同時に維持するため、変更量を対応する集計へ加える。 */
-static void nnueAddSum(NnueState *state, int board_x, int board_y, int channel, int delta) {
+static void nnueAddSum(NnueState *state, int board_x, int board_y, int channel, int delta)
+{
     int group = 1 + (board_y / 5) * 3 + board_x / 5;
     state->regional_feature_sums[0][channel] += delta;
     state->regional_feature_sums[group][channel] += delta;
 }
 
 /* 公開モデルの整数精度を再現するため、四方向の特徴を１６ビットの和へ写像する。 */
-static void nnueMapFeature(NnueState *state, const NnueWeight *weight, int board_index, int16_t output_features[64]) {
+static void nnueMapFeature(NnueState *state, const NnueWeight *weight, int board_index, int16_t output_features[64])
+{
     memset(output_features, 0, 64 * sizeof(*output_features)); // 公開モデルと同じ尺度の出力を得るため、チャネルの並びと整数演算の精度を保つ。
     for (int direction_index = 0; direction_index < 4; ++direction_index) {
         const unsigned char *entry = weight->feature_mapping + ((size_t)(direction_index / 2) * NNUE_LINE_SHAPE_COUNT + state->line_shape_codes[board_index][direction_index]) * 2;
@@ -1374,7 +1407,8 @@ static void nnueMapFeature(NnueState *state, const NnueWeight *weight, int board
 }
 
 /* 盤外の特徴は空盤でも必要なので、境界を含めて特徴と領域和を準備する。 */
-static void nnueClearState(NnueState *state, const NnueWeight *weight) {
+static void nnueClearState(NnueState *state, const NnueWeight *weight)
+{
     memset(state, 0, sizeof(*state)); // 別の枝や前回の処理の値が集計へ混ざらないよう、使用前の状態をそろえる。
     for (int board_index = 0; board_index < BOARD_SIZE * BOARD_SIZE; ++board_index) {
         int board_x = board_index % BOARD_SIZE, board_y = board_index / BOARD_SIZE;
@@ -1424,7 +1458,8 @@ static void nnueClearState(NnueState *state, const NnueWeight *weight) {
 }
 
 /* 一手ごとの全再計算を避けるため、線上と畳み込み近傍の影響だけを差分反映する。 */
-static void nnueChangeCell(NnueState *state, const NnueWeight *weight, int board_x, int board_y, int old_code, int new_code) {
+static void nnueChangeCell(NnueState *state, const NnueWeight *weight, int board_x, int board_y, int old_code, int new_code)
+{
     unsigned char changed[BOARD_SIZE * BOARD_SIZE] = {0};
     int changed_cell_indices[44], changed_cell_count = 0;
     for (int direction_index = 0; direction_index < 4; ++direction_index) {
@@ -1473,15 +1508,18 @@ static void nnueChangeCell(NnueState *state, const NnueWeight *weight, int board
 }
 
 /* 保存経路を使えない場合も正しい評価を得るため、評価済み盤面との差だけを反映する。 */
-static void nnueSyncBoard(NnueState *state, const NnueWeight *weight, const int board[][BOARD_SIZE], int player_side) {
+static void nnueSyncBoard(NnueState *state, const NnueWeight *weight, const int board[][BOARD_SIZE], int player_side)
+{
     for (int board_y = 0; board_y < BOARD_SIZE; ++board_y) {
         for (int board_x = 0; board_x < BOARD_SIZE; ++board_x) {
             int previous_stone = state->evaluated_board[board_y][board_x], updated_stone = board[board_y][board_x];
             if (previous_stone == updated_stone) {
                 continue;
             }
-            int previous_stone_code = !previous_stone ? 0 : previous_stone == player_side ? 1 : 2;
-            int updated_stone_code = !updated_stone ? 0 : updated_stone == player_side ? 1 : 2;
+            int previous_stone_code = !previous_stone ? 0 : previous_stone == player_side ? 1
+                                                                                          : 2;
+            int updated_stone_code = !updated_stone ? 0 : updated_stone == player_side ? 1
+                                                                                       : 2;
             nnueChangeCell(state, weight, board_x, board_y, previous_stone_code, updated_stone_code); // 一手ごとの全再計算を避けるため、線上と畳み込み近傍の影響だけを差分反映する。
             state->evaluated_board[board_y][board_x] = updated_stone;
         }
@@ -1489,7 +1527,8 @@ static void nnueSyncBoard(NnueState *state, const NnueWeight *weight, const int 
 }
 
 /* 取消しで丸め差や再計算が生じないよう、変化する特徴と領域和を保存する。 */
-static void nnueSaveMove(NnueState *state, NnueRestore *restore, int board_x, int board_y) {
+static void nnueSaveMove(NnueState *state, NnueRestore *restore, int board_x, int board_y)
+{
     unsigned char feature_saved_mask[BOARD_SIZE * BOARD_SIZE] = {0}, convolution_saved_mask[BOARD_SIZE * BOARD_SIZE] = {0};
     restore->changed_board_index = board_y * BOARD_SIZE + board_x;
     restore->previous_stone = state->evaluated_board[board_y][board_x];
@@ -1530,7 +1569,8 @@ static void nnueSaveMove(NnueState *state, NnueRestore *restore, int board_x, in
 }
 
 /* 兄弟の枝へ直前の特徴を持ち込まないよう、保存した評価状態を正確に戻す。 */
-static void nnueUndoMove(NnueState *state, const NnueRestore *restore) {
+static void nnueUndoMove(NnueState *state, const NnueRestore *restore)
+{
     if (restore->changed_board_index < 0) {
         return;
     }
@@ -1548,7 +1588,8 @@ static void nnueUndoMove(NnueState *state, const NnueRestore *restore) {
 }
 
 /* 評価しなかった仮着手を含む経路にも対応するため、共通部分へ戻して必要な枝だけ反映する。 */
-static NnueState *nnueSync(const Position *position, int player_side) {
+static NnueState *nnueSync(const Position *position, int player_side)
+{
     int model_index = player_side == STONE_WHITE;
     NnueState *state = &neural_evaluation_states[model_index];
     NnuePath *path = &neural_evaluation_paths[model_index];
@@ -1611,7 +1652,8 @@ static NnueState *nnueSync(const Position *position, int player_side) {
 }
 
 /* 環境による学習評価の差を避けるため、ＳＳＥ２と標準Ｃで同じ符号付き整数の積和を求める。 */
-static void nnueLinear(const NnueLayer *layer, const int8_t *input, int32_t *output) {
+static void nnueLinear(const NnueLayer *layer, const int8_t *input, int32_t *output)
+{
     for (int output_index = 0; output_index < layer->output_count; ++output_index) { // 公開モデルと同じ尺度の出力を得るため、チャネルの並びと整数演算の精度を保つ。
         const int8_t *weight = layer->matrix_weights + output_index * layer->input_count;
         int32_t output_sum = layer->output_biases[output_index];
@@ -1637,7 +1679,8 @@ static void nnueLinear(const NnueLayer *layer, const int8_t *input, int32_t *out
 }
 
 /* 学習時の尺度と推論の整数値を一致させるため、丸め・飽和・活性化を同じ順で適用する。 */
-static void nnueQuantize(int8_t *output, const int32_t *input, int output_count, int shift, int apply_relu) {
+static void nnueQuantize(int8_t *output, const int32_t *input, int output_count, int shift, int apply_relu)
+{
     int output_index = 0;
 #if NNUE_USE_SSE2
 
@@ -1662,7 +1705,8 @@ static void nnueQuantize(int8_t *output, const int32_t *input, int output_count,
 }
 
 /* 公開モデルの特徴間の積を再現するため、二つの投影を量子化してから出力投影へ通す。 */
-static void nnueStar(const NnueStar *star, const int8_t input[64], int8_t output[64]) {
+static void nnueStar(const NnueStar *star, const int8_t input[64], int8_t output[64])
+{
     int32_t values[128];
     int8_t first_projection_features[128], second_projection_features[128], product[64];
     nnueLinear(&star->first_projection, input, values); // 環境による学習評価の差を避けるため、ＳＳＥ２と標準Ｃで同じ符号付き整数の積和を求める。
@@ -1677,7 +1721,8 @@ static void nnueStar(const NnueStar *star, const int8_t input[64], int8_t output
 }
 
 /* 探索の勝敗判断を公開モデルに合わせるため、全盤と局所領域から３種類の整数出力を求める。 */
-static void nnueValueLogits(const Position *position, int player_side, int32_t output[4]) {
+static void nnueValueLogits(const Position *position, int player_side, int32_t output[4])
+{
     NnueState *state = nnueSync(position, player_side);
     const NnueWeight *weight = &neural_model_weights[player_side == STONE_WHITE];
     int8_t layer0[320], group[9][64], features[64], quadrant[64], layer1[64], layer2[64];
@@ -1686,7 +1731,8 @@ static void nnueValueLogits(const Position *position, int player_side, int32_t o
     for (int region_y = 0; region_y < 3; ++region_y) { // 公開モデルと同じ尺度の出力を得るため、チャネルの並びと整数演算の精度を保つ。
         for (int region_x = 0; region_x < 3; ++region_x) {
             nnueQuantize(features, state->regional_feature_sums[1 + region_y * 3 + region_x], 64, 5, 0); // 学習時の尺度と推論の整数値を一致させるため、丸め・飽和・活性化を同じ順で適用する。
-            const NnueStar *star = region_x == 1 && region_y == 1 ? &weight->center_projection : region_x == 1 || region_y == 1 ? &weight->edge_projection : &weight->corner_projection;
+            const NnueStar *star = region_x == 1 && region_y == 1 ? &weight->center_projection : region_x == 1 || region_y == 1 ? &weight->edge_projection
+                                                                                                                                : &weight->corner_projection;
             nnueStar(star, features, group[region_y * 3 + region_x]); // 公開モデルの特徴間の積を再現するため、二つの投影を量子化してから出力投影へ通す。
         }
     }
@@ -1708,7 +1754,8 @@ static void nnueValueLogits(const Position *position, int player_side, int32_t o
 }
 
 /* 方策の積和が途中であふれないよう、活性化後の畳み込み特徴を６４ビットで累積する。 */
-static int64_t nnuePolicyDot(const int16_t dynamic_weights[32], const int16_t convolution_values[32]) {
+static int64_t nnuePolicyDot(const int16_t dynamic_weights[32], const int16_t convolution_values[32])
+{
 #if NNUE_USE_SSE2
     __m128i zero = _mm_setzero_si128(), low_lane_accumulator = zero, high_lane_accumulator = zero;
     int64_t lanes[4];
@@ -1732,7 +1779,8 @@ static int64_t nnuePolicyDot(const int16_t dynamic_weights[32], const int16_t co
 }
 
 /* 探索対象外の出力に時間を使わないよう、必要な候補の優先度だけを計算する。合法性は探索側で確認する。 */
-static void nnuePolicy(const Position *position, int player_side, float policy[BOARD_SIZE * BOARD_SIZE], const unsigned char *compute_mask) {
+static void nnuePolicy(const Position *position, int player_side, float policy[BOARD_SIZE * BOARD_SIZE], const unsigned char *compute_mask)
+{
     NnueState *state = nnueSync(position, player_side);
     const NnueWeight *weight = &neural_model_weights[player_side == STONE_WHITE];
     int8_t features[64], hidden[64];
@@ -1765,209 +1813,211 @@ static void nnuePolicy(const Position *position, int player_side, float policy[B
 
 #endif
 
-/* 同じ７点形状の判定を再利用し、ライブラリ準拠の禁じ手検査で反復計算を減らす。 */
+/* 再帰判定中も連続区間の端点を共有し、仮着手を含む五かどうかを同じ基準で確認する。 */
 typedef struct {
-    unsigned char three_direction_flags, four_direction_flags, jumping_four_count, initialized;
-} LibraryPattern;
+    int first_offset, last_offset;
+} RenjuRunBounds;
 
-/* 三・四の方向と飛び四を別々に保持し、対局ライブラリと同じ重複の数え方を保つ。 */
+/* 両端で勝てる同一の四と、同じ方向にある別々の四を混同しないための集計。 */
 typedef struct {
-    int three_direction_flags, four_direction_flags, jumping_four_count;
-} LibraryShape;
-static LibraryPattern library_line_pattern_cache[LIBRARY_PATTERN_COUNT];
-static const int library_direction_x_offsets[4] = {1, 0, 1, -1};
-static const int library_direction_y_offsets[4] = {1, 1, 0, 1};
-static const int library_direction_flags[4] = {LEFT, TATE, YOKO, RIGT};
+    int four_count, is_straight_four;
+} RenjuDirectionFours;
 
-/* 対局側を書き換えず同じ禁じ手判定を得るため、仮着手を参照だけで織り込む。 */
-static LibraryShape libraryShapeAt(const Position *position, int board_x, int board_y, int added_x, int added_y) {
-    LibraryShape result = {0};
-    for (int direction = 0; direction < 4; ++direction) { // 対局ライブラリと判定がずれないよう、方向の重複と仮着手による変化を分けて扱う。
-        int line_stones[7], ternary_line_code = 0, power = 1;
-        for (int line_point_index = 0; line_point_index < 7; ++line_point_index) {
-            if (line_point_index == 1) {
-                line_stones[line_point_index] = 1;
-                continue;
-            }
-            int neighbor_x = board_x + (line_point_index - 1) * library_direction_x_offsets[direction];
-            int neighbor_y = board_y + (line_point_index - 1) * library_direction_y_offsets[direction];
-            int stone = !inside(neighbor_x, neighbor_y) ? STONE_WHITE : neighbor_x == added_x && neighbor_y == added_y ? STONE_BLACK : position->board[neighbor_y][neighbor_x];
-            line_stones[line_point_index] = stone == STONE_SPACE ? 0 : stone == STONE_BLACK ? 1 : 2;
-            ternary_line_code += line_stones[line_point_index] * power;
-            power *= 3;
-        }
-        LibraryPattern *pattern = &library_line_pattern_cache[ternary_line_code];
-        if (!pattern->initialized) {
-            int stones = 0, spaces = 0;
-            if (!line_stones[0]) {
-                for (int line_point_index = 1; line_point_index <= 4; ++line_point_index) {
-                    if (line_stones[line_point_index] == 1) {
-                        if (++stones == 3) {
-                            break;
-                        }
-                    }
-                    else if (!line_stones[line_point_index]) {
-                        ++spaces;
-                    }
-                    else {
-                        break;
-                    }
-                }
-                pattern->three_direction_flags = (unsigned char)(stones == 3 && ((spaces == 1 && !line_stones[5]) || (spaces == 0 && !line_stones[4])));
-            }
-            stones = spaces = 0;
-            for (int line_point_index = 1; line_point_index <= 5; ++line_point_index) {
-                if (line_stones[line_point_index] == 1) {
-                    if (++stones == 4) {
-                        break;
-                    }
-                }
-                else if (!line_stones[line_point_index]) {
-                    ++spaces;
-                }
-                else {
-                    break;
-                }
-            }
-            pattern->jumping_four_count = (unsigned char)(stones == 4 && spaces == 1);
-            pattern->four_direction_flags = (unsigned char)(pattern->jumping_four_count || (stones == 4 && spaces == 0 && (!line_stones[0] || !line_stones[5])));
-            pattern->initialized = 1;
-        }
-        result.three_direction_flags += pattern->three_direction_flags * library_direction_flags[direction];
-        result.four_direction_flags += pattern->four_direction_flags * library_direction_flags[direction];
-        result.jumping_four_count += pattern->jumping_four_count;
+static const int renju_direction_x_offsets[4] = {1, 0, 1, 1};
+static const int renju_direction_y_offsets[4] = {0, 1, 1, -1};
+
+/* 三を伸ばす手自身の禁じ手を確認するため、相互に呼び出す判定を先に宣言する。 */
+static int renjuJudgeBlack(int board[][BOARD_SIZE], int board_x, int board_y);
+
+/* 盤端を別の石と同じ停止条件で扱い、線の走査が盤外へ進むことを防ぐ。 */
+static int renjuCellAt(const int board[][BOARD_SIZE], int board_x, int board_y)
+{
+    return inside(board_x, board_y) ? board[board_y][board_x] : -1;
+}
+
+/* 勝ちを作った仮着手が元の石と連続していることも確認できるよう、長さだけでなく両端を求める。 */
+static RenjuRunBounds renjuRunBounds(const int board[][BOARD_SIZE], int board_x, int board_y, int direction_index)
+{
+    RenjuRunBounds bounds = {0, 0};
+    int stone = board[board_y][board_x];
+    int direction_x = renju_direction_x_offsets[direction_index], direction_y = renju_direction_y_offsets[direction_index];
+    while (renjuCellAt(board, board_x + (bounds.first_offset - 1) * direction_x, board_y + (bounds.first_offset - 1) * direction_y) == stone) {
+        bounds.first_offset--;
     }
+    while (renjuCellAt(board, board_x + (bounds.last_offset + 1) * direction_x, board_y + (bounds.last_offset + 1) * direction_y) == stone) {
+        bounds.last_offset++;
+    }
+    return bounds;
+}
+
+/* 新ライブラリと同様に、長連制限中の黒だけはちょうど五を勝ちとする。 */
+static int renjuIsWinningLength(int stone, int run_length)
+{
+    return stone == STONE_BLACK && AI_ENABLE_OVERLINE ? run_length == 5 : run_length >= 5;
+}
+
+/* 三や四に必要な石がない方向では、結果が変わらない範囲で仮着手と再帰を省く。 */
+static int renjuNearbyStoneCount(const int board[][BOARD_SIZE], int board_x, int board_y, int direction_index, int radius)
+{
+    int stone_count = 0, stone = board[board_y][board_x];
+    for (int offset = -radius; offset <= radius; offset++) {
+        if (offset && renjuCellAt(board, board_x + offset * renju_direction_x_offsets[direction_index], board_y + offset * renju_direction_y_offsets[direction_index]) == stone) {
+            stone_count++;
+        }
+    }
+    return stone_count;
+}
+
+/* 旧方向フラグでは同一線上の四四を表せないため、五になる空点を数えて四を区別する。 */
+static RenjuDirectionFours renjuFoursInDirection(int board[][BOARD_SIZE], int board_x, int board_y, int direction_index)
+{
+    RenjuDirectionFours result = {0, 0};
+    int completion_count = 0, first_completion = 0, last_completion = 0;
+    int stone = board[board_y][board_x];
+    if (renjuNearbyStoneCount(board, board_x, board_y, direction_index, 4) < 3) {
+        return result;
+    }
+    for (int offset = -4; offset <= 4; offset++) {
+        int neighbor_x = board_x + offset * renju_direction_x_offsets[direction_index];
+        int neighbor_y = board_y + offset * renju_direction_y_offsets[direction_index];
+        if (!offset || renjuCellAt(board, neighbor_x, neighbor_y) != STONE_SPACE) {
+            continue;
+        }
+        board[neighbor_y][neighbor_x] = stone; // 専用盤面だけへ仮置きし、元の石を含む五ができるかを確かめる。
+        RenjuRunBounds bounds = renjuRunBounds(board, board_x, board_y, direction_index);
+        int completes_five = bounds.first_offset <= offset && offset <= bounds.last_offset && renjuIsWinningLength(stone, bounds.last_offset - bounds.first_offset + 1);
+        board[neighbor_y][neighbor_x] = STONE_SPACE; // 後続の候補へ仮着手の影響を残さないよう、判定結果を使う前に戻す。
+        if (completes_five) {
+            if (!completion_count) {
+                first_completion = offset;
+            }
+            last_completion = offset;
+            completion_count++;
+        }
+    }
+    result.is_straight_four = completion_count == 2 && last_completion - first_completion == 5; // 五の両端が五点離れた場合だけ、同じ四石による達四として一つにまとめる。
+    result.four_count = result.is_straight_four ? 1 : completion_count;
     return result;
 }
 
-/* 同じ方向の重複を三三・四四に数えないよう、方向フラグの複数ビットを調べる。 */
-static int libraryMultipleDirections(int direction_flags) {
-    return direction_flags && direction_flags != LEFT && direction_flags != TATE && direction_flags != YOKO && direction_flags != RIGT;
+/* 幾何学的な三でも合法に達四へ伸ばせなければ偽の三なので、伸ばす手の禁じ手まで再帰確認する。 */
+static int renjuThreeInDirection(int board[][BOARD_SIZE], int board_x, int board_y, int direction_index)
+{
+    int stone = board[board_y][board_x];
+    if (renjuNearbyStoneCount(board, board_x, board_y, direction_index, 3) < 2 || renjuFoursInDirection(board, board_x, board_y, direction_index).four_count) {
+        return 0;
+    }
+    for (int offset = -4; offset <= 4; offset++) {
+        int neighbor_x = board_x + offset * renju_direction_x_offsets[direction_index];
+        int neighbor_y = board_y + offset * renju_direction_y_offsets[direction_index];
+        if (!offset || renjuCellAt(board, neighbor_x, neighbor_y) != STONE_SPACE) {
+            continue;
+        }
+        board[neighbor_y][neighbor_x] = stone;
+        int is_true_three = 0;
+        if (renjuFoursInDirection(board, board_x, board_y, direction_index).is_straight_four) {
+            RenjuRunBounds bounds = renjuRunBounds(board, board_x, board_y, direction_index);
+            if (bounds.first_offset <= offset && offset <= bounds.last_offset) {
+                is_true_three = stone != STONE_BLACK || renjuJudgeBlack(board, neighbor_x, neighbor_y) == NOKINJITE; // 黒の伸ばし手だけは三三・四四・長連の設定に従い、偽の三を除く。
+            }
+        }
+        board[neighbor_y][neighbor_x] = STONE_SPACE;
+        if (is_true_three) {
+            return 1;
+        }
+    }
+    return 0;
 }
 
-/* 以前からある三・四を新しい禁じ手と誤認しないよう、仮着手前後の変化を比較する。 */
-static int libraryForbiddenChange(const Position *position, int board_x, int board_y) {
-    int first_three_direction_flags = 0, first_four_direction_flags = 0, first_four_x = 0, first_four_y = 0, jumping_four_increase = 0;
-    for (int neighbor_y = 0; neighbor_y < BOARD_SIZE; ++neighbor_y) { // 対局ライブラリと判定がずれないよう、方向の重複と仮着手による変化を分けて扱う。
-        for (int neighbor_x = 0; neighbor_x < BOARD_SIZE; ++neighbor_x) {
-            int is_added_point = neighbor_x == board_x && neighbor_y == board_y;
-            if (!is_added_point && position->board[neighbor_y][neighbor_x] != STONE_BLACK) {
-                continue;
+/* .libgomoku_b.c の実装順序に合わせ、五の成立、長連、四四、真の三三の順に判定する。 */
+static int renjuJudgeBlack(int board[][BOARD_SIZE], int board_x, int board_y)
+{
+    int has_winning_five = 0, has_overline = 0, four_count = 0;
+    for (int direction_index = 0; direction_index < 4; direction_index++) {
+        RenjuRunBounds bounds = renjuRunBounds(board, board_x, board_y, direction_index);
+        int run_length = bounds.last_offset - bounds.first_offset + 1;
+        has_winning_five |= renjuIsWinningLength(STONE_BLACK, run_length);
+        has_overline |= run_length >= 6;
+    }
+    if (has_winning_five) { // 別方向に長連が同時にできても、実際の新ライブラリは五の成立を先に採用する。
+        return NOKINJITE;
+    }
+    if (AI_ENABLE_OVERLINE && has_overline) {
+        return CHOLEN;
+    }
+    if (AI_ENABLE_DOUBLE_FOUR) {
+        for (int direction_index = 0; direction_index < 4; direction_index++) {
+            four_count += renjuFoursInDirection(board, board_x, board_y, direction_index).four_count;
+            if (four_count >= 2) {
+                return SHISHI;
             }
-            int is_affected_line = is_added_point;
-            int offset_x = neighbor_x - board_x, offset_y = neighbor_y - board_y;
-            for (int step_index = 0; !is_affected_line && step_index < 4; ++step_index) {
-                int offset = library_direction_x_offsets[step_index] ? offset_x * library_direction_x_offsets[step_index] : offset_y;
-                is_affected_line = offset >= -5 && offset <= 1 && offset_x == offset * library_direction_x_offsets[step_index] && offset_y == offset * library_direction_y_offsets[step_index];
+        }
+    }
+    if (AI_ENABLE_DOUBLE_THREE) {
+        int possible_directions[4], possible_direction_count = 0, true_three_count = 0;
+        for (int direction_index = 0; direction_index < 4; direction_index++) {
+            if (renjuNearbyStoneCount(board, board_x, board_y, direction_index, 3) >= 2) {
+                possible_directions[possible_direction_count++] = direction_index;
             }
-            if (!is_affected_line) {
-                continue;
-            }
-            LibraryShape previous_shape = {0};
-            if (!is_added_point) {
-                previous_shape = libraryShapeAt(position, neighbor_x, neighbor_y, -1, -1);
-            }
-            LibraryShape updated_shape = libraryShapeAt(position, neighbor_x, neighbor_y, board_x, board_y);
-            if (AI_ENABLE_DOUBLE_THREE && updated_shape.three_direction_flags) { // 対局規則に合わせて黒の三三を除外するため、設定と適用条件を確認する。１で有効。
-                if (!previous_shape.three_direction_flags && libraryMultipleDirections(updated_shape.three_direction_flags)) { // 対局ライブラリと判定がずれないよう、方向の重複と仮着手による変化を分けて扱う。
-                    return 1;
-                }
-                if (updated_shape.three_direction_flags != previous_shape.three_direction_flags) {
-                    if (!first_three_direction_flags) {
-                        first_three_direction_flags = updated_shape.three_direction_flags;
-                    }
-                    else if (first_three_direction_flags != updated_shape.three_direction_flags) {
-                        return 1;
-                    }
-                }
-            }
-            if (AI_ENABLE_DOUBLE_FOUR) { // 対局規則に合わせて黒の四四を除外するため、設定と適用条件を確認する。１で有効。
-                jumping_four_increase += updated_shape.jumping_four_count - previous_shape.jumping_four_count; // 対局ライブラリと判定がずれないよう、方向の重複と仮着手による変化を分けて扱う。
-                if (!updated_shape.four_direction_flags) {
-                    continue;
-                }
-                if (!previous_shape.four_direction_flags && libraryMultipleDirections(updated_shape.four_direction_flags)) {
-                    return 1;
-                }
-                if (updated_shape.four_direction_flags != previous_shape.four_direction_flags) {
-                    if (!first_four_direction_flags) {
-                        first_four_direction_flags = updated_shape.four_direction_flags;
-                        first_four_x = neighbor_x;
-                        first_four_y = neighbor_y;
-                    }
-                    else {
-                        int distance_x = abs(neighbor_x - first_four_x), distance_y = abs(neighbor_y - first_four_y);
-                        int distance = distance_x == 0 ? distance_y : distance_y == 0 || distance_x == distance_y ? distance_x : -1;
-                        if (first_four_direction_flags != updated_shape.four_direction_flags || distance > 2) {
-                            return 1;
-                        }
-                    }
+        }
+        if (possible_direction_count >= 2) { // 達四の四石は幅四点に収まるので、三点以内に二石ある方向が二つ未満なら三三にはならない。
+            for (int direction_index = 0; direction_index < possible_direction_count; direction_index++) {
+                true_three_count += renjuThreeInDirection(board, board_x, board_y, possible_directions[direction_index]);
+                if (true_three_count >= 2) {
+                    return SANSAN;
                 }
             }
         }
     }
-    return AI_ENABLE_DOUBLE_FOUR && jumping_four_increase > 1;
+    return NOKINJITE;
 }
 
-/* 対局ライブラリとの判定差を避けるため、長連を先に検査し五連成立時は三三・四四を免除する。 */
-static int isForbiddenBlackMove(Position *position, int board_x, int board_y) {
-    int has_exact_five = 0, has_overline = 0, nearby_black_count = 0;
-    if (!inside(board_x, board_y) || position->board[board_y][board_x] != STONE_SPACE) { // 余白の壁や盤外を着手候補に含めないよう、参照先の範囲を限定する。
+/* 局面ごとの合法性を再利用しつつ、対局側の盤面・check・履歴に触れず新規則を適用する。 */
+static int isForbiddenBlackMove(Position *position, int board_x, int board_y)
+{
+    if (!inside(board_x, board_y) || position->board[board_y][board_x] != STONE_SPACE) {
         return 1;
     }
-    if (position->black_legality_cache[board_y][board_x]) { // 対局ライブラリと判定がずれないよう、方向の重複と仮着手による変化を分けて扱う。
+    if (position->black_legality_cache[board_y][board_x]) {
         return position->black_legality_cache[board_y][board_x] == 2;
     }
-    for (int direction_index = 0; direction_index < 4; direction_index++) {
-        int length = 1;
-        for (int direction_sign = -1; direction_sign <= 1; direction_sign += 2) {
-            for (int distance_from_move = 1; distance_from_move < BOARD_SIZE; distance_from_move++) {
-                static const int neighbor_x_offset[4] = {1, 0, 1, 1}, neighbor_y_offset[4] = {0, 1, -1, 1};
-                int neighbor_x = board_x + direction_sign * distance_from_move * neighbor_x_offset[direction_index], neighbor_y = board_y + direction_sign * distance_from_move * neighbor_y_offset[direction_index];
-                if (!inside(neighbor_x, neighbor_y) || position->board[neighbor_y][neighbor_x] != STONE_BLACK) { // 余白の壁や盤外を着手候補に含めないよう、参照先の範囲を限定する。
-                    break;
-                }
-                length++; // 対局ライブラリと判定がずれないよう、方向の重複と仮着手による変化を分けて扱う。
-            }
-        }
-        has_exact_five |= length == 5;
-        has_overline |= length >= 6;
-    }
-    if (AI_ENABLE_OVERLINE && has_overline) { // 対局規則に合わせて黒の長連を除外するため、設定と適用条件を確認する。１で有効。
-        position->black_legality_cache[board_y][board_x] = 2; // 対局ライブラリと判定がずれないよう、方向の重複と仮着手による変化を分けて扱う。
-        return 1;
-    }
-    if (has_exact_five || (!AI_ENABLE_DOUBLE_THREE && !AI_ENABLE_DOUBLE_FOUR)) { // 対局規則に合わせて黒の三三を除外するため、設定と適用条件を確認する。１で有効。
-        position->black_legality_cache[board_y][board_x] = 1; // 対局ライブラリと判定がずれないよう、方向の重複と仮着手による変化を分けて扱う。
-        return 0;
-    }
-
-    for (int neighbor_y = rpMax(board_y - 6, 0); neighbor_y <= rpMin(board_y + 6, BOARD_SIZE - 1); neighbor_y++) {
-        for (int neighbor_x = rpMax(board_x - 6, 0); neighbor_x <= rpMin(board_x + 6, BOARD_SIZE - 1); neighbor_x++) {
-            nearby_black_count += position->board[neighbor_y][neighbor_x] == STONE_BLACK;
-        }
-    }
-    if (nearby_black_count < 3) {
-        position->black_legality_cache[board_y][board_x] = 1;
-        return 0;
-    }
-    int forbidden = libraryForbiddenChange(position, board_x, board_y);
+    position->board[board_y][board_x] = STONE_BLACK; // 再帰検査は探索専用盤面だけを参照し、外部の入力盤面へ書き込まない。
+    int forbidden = renjuJudgeBlack(position->board, board_x, board_y) != NOKINJITE;
+    position->board[board_y][board_x] = STONE_SPACE;
     position->black_legality_cache[board_y][board_x] = (unsigned char)(forbidden ? 2 : 1);
     return forbidden;
 }
 
+/* 幾何学的な二重三を必勝と断定しないため、合法に達四へ伸ばせる方向が二つあるか確認する。 */
+static int renjuHasTrueDoubleThree(Position *position, int board_x, int board_y, int stone)
+{
+    int true_three_count = 0;
+    position->board[board_y][board_x] = stone;
+    for (int direction_index = 0; direction_index < 4; direction_index++) {
+        true_three_count += renjuThreeInDirection(position->board, board_x, board_y, direction_index);
+        if (true_three_count >= 2) {
+            break;
+        }
+    }
+    position->board[board_y][board_x] = STONE_SPACE;
+    return true_three_count >= 2;
+}
+
 /* 探索で無効な手を採用しないよう空点と盤内を確認し、黒だけに禁じ手制限を適用する。 */
-static int isLegalMove(Position *position, int board_x, int board_y, int stone) {
+static int isLegalMove(Position *position, int board_x, int board_y, int stone)
+{
     return inside(board_x, board_y) && position->board[board_y][board_x] == STONE_SPACE && (stone != STONE_BLACK || !isForbiddenBlackMove(position, board_x, board_y));
 }
 
 /* 内部位置でも公開規則を共通に使うため、盤面座標へ戻して合法性を確認する。 */
-static int rpLegal(Position *position, int padded_position) {
+static int rpLegal(Position *position, int padded_position)
+{
     return rpInBoard(padded_position) && isLegalMove(position, rpX(padded_position), rpY(padded_position), rpState(position)->side_to_move + 1);
 }
 
 /* 同じ局面キーを再現できるよう、移植元と同じ擬似乱数系列を使う。 */
-static uint64_t rpRandom(uint64_t *random_state) {
+static uint64_t rpRandom(uint64_t *random_state)
+{
     uint64_t random_bits = (*random_state += UINT64_C(0x9e3779b97f4a7c15));
     random_bits = (random_bits ^ (random_bits >> 30)) * UINT64_C(0xbf58476d1ce4e5b9);
     random_bits = (random_bits ^ (random_bits >> 27)) * UINT64_C(0x94d049bb133111eb);
@@ -1975,7 +2025,8 @@ static uint64_t rpRandom(uint64_t *random_state) {
 }
 
 /* 移植元の脅威の優先順位を保つため、四方向を一つの複合形状へ分類する。 */
-static int rpAggregate(const unsigned char direction_patterns[4]) {
+static int rpAggregate(const unsigned char direction_patterns[4])
+{
     int line_pattern_counts[16] = {0};
     for (int direction_index = 0; direction_index < 4; direction_index++) {
         line_pattern_counts[direction_patterns[direction_index]]++;
@@ -2022,7 +2073,8 @@ static int rpAggregate(const unsigned char direction_patterns[4]) {
 }
 
 /* 局面ごとの準備を減らすため、形状符号・近傍・削減係数・局面キーを一度だけ構築する。 */
-static void rpInitialize(void) {
+static void rpInitialize(void)
+{
     uint64_t hash_random_seed = UINT64_C(0xa52ca39782739747);
     int pattern_code = 0;
     static const int line_ordering_scores[16] = {-1, 0, 0, 1, 2, 6, 6, 6, 9, 9, 16, 20, 30, 30, 100, 500};
@@ -2042,8 +2094,10 @@ static void rpInitialize(void) {
             }
         }
     }
-    int square_radius = AI_CANDIDATE_RANGE <= 1 ? 2 : AI_CANDIDATE_RANGE <= 3 ? 3 : 4;
-    int line_radius = AI_CANDIDATE_RANGE == 0 ? 2 : AI_CANDIDATE_RANGE <= 2 ? 3 : 4;
+    int square_radius = AI_CANDIDATE_RANGE <= 1 ? 2 : AI_CANDIDATE_RANGE <= 3 ? 3
+                                                                              : 4;
+    int line_radius = AI_CANDIDATE_RANGE == 0 ? 2 : AI_CANDIDATE_RANGE <= 2 ? 3
+                                                                            : 4;
     if (AI_CANDIDATE_RANGE != 5) {
         for (int board_y = -line_radius; board_y <= line_radius; board_y++) {
             for (int board_x = -line_radius; board_x <= line_radius; board_x++) {
@@ -2092,7 +2146,8 @@ static void rpInitialize(void) {
 }
 
 /* 盤端と通常の線を同じ表で判定するため、壁までの半直線を三進符号へ変換する。 */
-static int rpLineIndex(const Position *position, int padded_position, int direction_index, int swap_colors) {
+static int rpLineIndex(const Position *position, int padded_position, int direction_index, int swap_colors)
+{
     int half_line_codes[2];
     for (int half_line_index = 0; half_line_index < 2; half_line_index++) {
         int half_line_code = 0, ternary_power = 1, direction_step = (half_line_index ? 1 : -1) * padded_direction_offsets[direction_index];
@@ -2101,7 +2156,8 @@ static int rpLineIndex(const Position *position, int padded_position, int direct
             if (piece == 3) {
                 break;
             }
-            int ternary_digit = piece == 2 ? 0 : piece == 0 ? 1 : 2;
+            int ternary_digit = piece == 2 ? 0 : piece == 0 ? 1
+                                                            : 2;
             if (swap_colors && ternary_digit) {
                 ternary_digit = 3 - ternary_digit;
             }
@@ -2114,30 +2170,14 @@ static int rpLineIndex(const Position *position, int padded_position, int direct
 }
 
 /* 手番で評価の意味が変わらないよう、空点の古典評価を黒と白の差で保持する。 */
-static int rpCellValue(const RpCell *board_cell) {
+static int rpCellValue(const RpCell *board_cell)
+{
     return classical_pattern_evaluations[board_cell->pattern_codes[0]] - classical_pattern_evaluations[board_cell->pattern_codes[1]];
 }
 
-/* 長連が許可される設定でも形状表との対応を保つため、仮置きした黒の六連を確認する。 */
-static int rpPotentialOverline(const Position *position, int padded_position) {
-    for (int direction_index = 0; direction_index < 4; direction_index++) {
-        int length = 1;
-        for (int direction_sign = -1; direction_sign <= 1; direction_sign += 2) {
-            int neighbor_position = padded_position + direction_sign * padded_direction_offsets[direction_index];
-            while (rpPiece(position, neighbor_position) == 0) {
-                length++;
-                neighbor_position += direction_sign * padded_direction_offsets[direction_index];
-            }
-        }
-        if (length >= 6) {
-            return 1;
-        }
-    }
-    return 0;
-}
-
 /* 全方向の表引きを繰り返さないよう、変わった方向から複合形状と集計を更新する。 */
-static void rpUpdateLineCell(Position *position, int padded_position, int adjust_counts, int direction) {
+static void rpUpdateLineCell(Position *position, int padded_position, int adjust_counts, int direction)
+{
     RpCell *board_cell = &position->board_cells[padded_position];
     RpState *current_state = rpState(position);
     if (adjust_counts) { // 盤面・形状集計・局面キーの対応を保ち、差分更新後も全再計算と同じ状態にする。
@@ -2167,7 +2207,7 @@ static void rpUpdateLineCell(Position *position, int padded_position, int adjust
                 line_pattern_counts[direction_patterns[direction_index]]++;
             }
 
-            if ((AI_ENABLE_OVERLINE && line_pattern_counts[LINE_PATTERN_OVERLINE] && (!line_pattern_counts[LINE_PATTERN_FIVE] || rpPotentialOverline(position, padded_position))) || (!line_pattern_counts[LINE_PATTERN_FIVE] && ((AI_ENABLE_DOUBLE_FOUR && line_pattern_counts[LINE_PATTERN_CLOSED_FOUR] + line_pattern_counts[LINE_PATTERN_CLOSED_FOUR_STRONG] + line_pattern_counts[LINE_PATTERN_OPEN_FOUR] >= 2) || (AI_ENABLE_DOUBLE_THREE && line_pattern_counts[LINE_PATTERN_OPEN_THREE] + line_pattern_counts[LINE_PATTERN_OPEN_THREE_STRONG] >= 2)))) { // 対局規則に合わせて黒の長連を除外するため、設定と適用条件を確認する。１で有効。
+            if (!line_pattern_counts[LINE_PATTERN_FIVE] && ((AI_ENABLE_OVERLINE && line_pattern_counts[LINE_PATTERN_OVERLINE]) || (AI_ENABLE_DOUBLE_FOUR && line_pattern_counts[LINE_PATTERN_CLOSED_FOUR] + line_pattern_counts[LINE_PATTERN_CLOSED_FOUR_STRONG] + line_pattern_counts[LINE_PATTERN_OPEN_FOUR] >= 2) || (AI_ENABLE_DOUBLE_THREE && line_pattern_counts[LINE_PATTERN_OPEN_THREE] + line_pattern_counts[LINE_PATTERN_OPEN_THREE_STRONG] >= 2))) { // 五を先に認める新規則に合わせ、幾何学的な禁じ手候補も五の成立時は除外しない。
                 board_cell->combined_patterns[player_side] = COMBINED_PATTERN_FORBIDDEN; // 盤面・形状集計・局面キーの対応を保ち、差分更新後も全再計算と同じ状態にする。
             }
         }
@@ -2184,12 +2224,14 @@ static void rpUpdateLineCell(Position *position, int padded_position, int adjust
 }
 
 /* 初期化や保存を使わない復元でも正しい形状を得るため、空点の全方向を更新する。 */
-static void rpUpdateCell(Position *position, int padded_position, int adjust_counts) {
+static void rpUpdateCell(Position *position, int padded_position, int adjust_counts)
+{
     rpUpdateLineCell(position, padded_position, adjust_counts, -1); // 全方向の表引きを繰り返さないよう、変わった方向から複合形状と集計を更新する。
 }
 
 /* 着手取消し時の形状再計算を省くため、変化前の空点情報を保存する。 */
-static void rpSaveCell(Position *position, RpMoveRestore *restore, int padded_position) {
+static void rpSaveCell(Position *position, RpMoveRestore *restore, int padded_position)
+{
     RpCellRestore *saved = &restore->saved_cells[restore->saved_cell_count++];
     saved->padded_position = (uint16_t)padded_position;
     memcpy(saved->direction_patterns, position->board_cells[padded_position].direction_patterns, sizeof(saved->direction_patterns)); // 再計算や逆変換による差を避けるため、保存済みの値をそのまま引き継ぐ。
@@ -2198,7 +2240,8 @@ static void rpSaveCell(Position *position, RpMoveRestore *restore, int padded_po
 }
 
 /* 再帰探索で全盤を再構築しないよう、着手と空手を履歴・形状・候補へ差分反映する。 */
-static void rpMake(Position *position, int move) {
+static void rpMake(Position *position, int move)
+{
     rpPrefetchMove(position, move); // 子局面での置換表参照待ちを減らすため、内容を変えずに対応区画を先読みする。
     RpState *previous_state = rpState(position);
     int player_side = previous_state->side_to_move;
@@ -2216,7 +2259,8 @@ static void rpMake(Position *position, int move) {
     if (move == -1) {
         return;
     }
-    int distance = AI_CANDIDATE_RANGE == 0 ? 2 : AI_CANDIDATE_RANGE == 4 ? 4 : 3;
+    int distance = AI_CANDIDATE_RANGE == 0 ? 2 : AI_CANDIDATE_RANGE == 4 ? 4
+                                                                         : 3;
     current_state->candidate_min_x = rpMin(current_state->candidate_min_x, rpMax(rpX(move) - distance, 0));
     current_state->candidate_min_y = rpMin(current_state->candidate_min_y, rpMax(rpY(move) - distance, 0));
     current_state->candidate_max_x = rpMax(current_state->candidate_max_x, rpMin(rpX(move) + distance, BOARD_SIZE - 1));
@@ -2259,7 +2303,8 @@ static void rpMake(Position *position, int move) {
 }
 
 /* 兄弟の枝の探索条件を一致させるため、直前の着手・空手と候補情報を復元する。 */
-static void rpUndo(Position *position) {
+static void rpUndo(Position *position)
+{
     int move = rpState(position)->last_move;
     position->history_ply--; // 盤面・形状集計・局面キーの対応を保ち、差分更新後も全再計算と同じ状態にする。
     if (move == -1) {
@@ -2301,7 +2346,8 @@ static void rpUndo(Position *position) {
 }
 
 /* 別の入力局面の評価経路を誤用しないよう、空盤へ戻し識別番号を更新する。 */
-static void rpClear(Position *position) {
+static void rpClear(Position *position)
+{
     memset(position, 0, sizeof(*position)); // 別の枝や前回の処理の値が集計へ混ざらないよう、使用前の状態をそろえる。
     position->position_serial = ++position_serial_counter; // 盤面・形状集計・局面キーの対応を保ち、差分更新後も全再計算と同じ状態にする。
     for (int element_index = 0; element_index < 1024; element_index++) {
@@ -2331,7 +2377,8 @@ static void rpClear(Position *position) {
 }
 
 /* 防御点を素早く探しつつ古い記録の誤用を避けるため、直近の記録を確認してから候補を走査する。 */
-static int rpFindPattern(Position *position, int player_side, int pattern_type, int prefer_last) {
+static int rpFindPattern(Position *position, int player_side, int pattern_type, int prefer_last)
+{
     int padded_position = pattern_type >= COMBINED_PATTERN_FOUR_THREE ? rpState(position)->last_strong_pattern_moves[player_side][pattern_type - COMBINED_PATTERN_FOUR_THREE] : 0;
     if (prefer_last && rpPiece(position, padded_position) == 2 && rpPattern4(position, padded_position, player_side) == pattern_type) {
         return padded_position;
@@ -2348,7 +2395,8 @@ static int rpFindPattern(Position *position, int player_side, int pattern_type, 
 }
 
 /* 探索窓と必勝判定に合う尺度を保つため、古典評価または公開モデルの確率を整数評価へ変換する。 */
-static int rpEvaluate(Position *position, int lower_bound, int upper_bound) {
+static int rpEvaluate(Position *position, int lower_bound, int upper_bound)
+{
     int player_side = rpState(position)->side_to_move;
     int previous_black_evaluation = position->history_ply ? position->search_states[position->history_ply - 1].black_evaluation : rpState(position)->black_evaluation;
     int evaluation_score = (rpState(position)->black_evaluation + previous_black_evaluation) / 2;
@@ -2403,12 +2451,14 @@ static int rpEvaluate(Position *position, int lower_bound, int upper_bound) {
 }
 
 /* 置換表の容量を越えず偏りも抑えるため、局面キーの上位ビットで区画を選ぶ。 */
-static uint32_t rpBucketIndex(uint64_t position_key) {
+static uint32_t rpBucketIndex(uint64_t position_key)
+{
     return (uint32_t)(position_key >> (64 - AI_TRANSPOSITION_TABLE_BITS));
 }
 
 /* 子局面での置換表参照待ちを減らすため、内容を変えずに対応区画を先読みする。 */
-static void rpPrefetchMove(Position *position, int move) {
+static void rpPrefetchMove(Position *position, int move)
+{
     if (!AI_ENABLE_TRANSPOSITION_PREFETCH) { // 子局面でのメモリ待ちを減らすための置換表先読みの切替。
         return;
     }
@@ -2426,17 +2476,22 @@ static void rpPrefetchMove(Position *position, int move) {
 }
 
 /* 別の深さから同じ局面へ到達しても必勝手数を解釈できるよう、保存尺度へ補正する。 */
-static int rpStoreValue(int value, int search_ply) {
-    return value >= FORCED_WIN_SCORE_THRESHOLD ? value + search_ply : value <= -FORCED_WIN_SCORE_THRESHOLD && value != SEARCH_SCORE_UNAVAILABLE ? value - search_ply : value;
+static int rpStoreValue(int value, int search_ply)
+{
+    return value >= FORCED_WIN_SCORE_THRESHOLD ? value + search_ply : value <= -FORCED_WIN_SCORE_THRESHOLD && value != SEARCH_SCORE_UNAVAILABLE ? value - search_ply
+                                                                                                                                                : value;
 }
 
 /* 置換表の必勝評価を現在の根からの手数で比較できるよう、補正を戻す。 */
-static int rpLoadValue(int value, int search_ply) {
-    return value >= FORCED_WIN_SCORE_THRESHOLD ? value - search_ply : value <= -FORCED_WIN_SCORE_THRESHOLD && value != SEARCH_SCORE_UNAVAILABLE ? value + search_ply : value;
+static int rpLoadValue(int value, int search_ply)
+{
+    return value >= FORCED_WIN_SCORE_THRESHOLD ? value - search_ply : value <= -FORCED_WIN_SCORE_THRESHOLD && value != SEARCH_SCORE_UNAVAILABLE ? value + search_ply
+                                                                                                                                                : value;
 }
 
 /* 同じ区画の別局面を混同しないよう、局面キーを照合して評価境界と参考手を取り出す。 */
-static RpTTProbe rpProbe(uint64_t position_key, int search_ply) {
+static RpTTProbe rpProbe(uint64_t position_key, int search_ply)
+{
     RpTTProbe probe_result = {0, SEARCH_SCORE_UNAVAILABLE, SEARCH_SCORE_UNAVAILABLE, 0, -20, 0, 0};
     RpTTEntry *bucket_entries = transposition_table[rpBucketIndex(position_key)].entries;
     for (int entry_index = 0; entry_index < 5; entry_index++) { // 別局面の値を誤用せず有用な結果を残すため、キー・深さ・世代を合わせて管理する。
@@ -2456,7 +2511,8 @@ static RpTTProbe rpProbe(uint64_t position_key, int search_ply) {
 }
 
 /* 限られた容量に有用な結果を残すため、深さと世代を考慮して保存先を選ぶ。 */
-static void rpStore(uint64_t position_key, int value, int static_evaluation, int is_principal_variation, int value_bound, int move, int depth, int search_ply) {
+static void rpStore(uint64_t position_key, int value, int static_evaluation, int is_principal_variation, int value_bound, int move, int depth, int search_ply)
+{
     RpTTEntry *bucket_entries = transposition_table[rpBucketIndex(position_key)].entries, *replacement_entry = &bucket_entries[0];
     for (int entry_index = 0; entry_index < 5; entry_index++) { // 別局面の値を誤用せず有用な結果を残すため、キー・深さ・世代を合わせて管理する。
         if (bucket_entries[entry_index].hash_fragment == (uint32_t)position_key) {
@@ -2484,17 +2540,20 @@ static void rpStore(uint64_t position_key, int value, int static_evaluation, int
 }
 
 /* 古い実績が探索順を固定しないよう、範囲の端で増減が緩くなる式で履歴を更新する。 */
-static void rpUpdateHistory(int *history_score, int bonus) {
+static void rpUpdateHistory(int *history_score, int bonus)
+{
     *history_score += bonus - *history_score * abs(bonus) / AI_HISTORY_SCORE_RANGE;
 }
 
 /* 深い読みで判明した有効手を重視するため、深さから履歴の加点量を求める。 */
-static int rpStatBonus(float depth) {
+static int rpStatBonus(float depth)
+{
     return rpMin((int)(AI_HISTORY_BONUS_QUADRATIC * depth * depth + AI_HISTORY_BONUS_LINEAR * depth + AI_HISTORY_BONUS_CONSTANT), AI_HISTORY_BONUS_MAX);
 }
 
 /* 後続の節点でも有効な静かな手を先に読むため、履歴とキラー手を更新する。 */
-static void rpQuietStats(RpStack *search_stack, int player_side, int move, int bonus) {
+static void rpQuietStats(RpStack *search_stack, int player_side, int move, int bonus)
+{
     rpUpdateHistory(&move_history_scores[player_side][move][0], bonus); // 古い実績が探索順を固定しないよう、範囲の端で増減が緩くなる式で履歴を更新する。
     if (search_stack->killer_moves[0] != move) {
         search_stack->killer_moves[1] = search_stack->killer_moves[0];
@@ -2503,7 +2562,8 @@ static void rpQuietStats(RpStack *search_stack, int player_side, int move, int b
 }
 
 /* 置換表で省略した探索も着手順へ反映するため、合法な参考手の履歴を評価境界に応じて更新する。 */
-static void rpTTStats(Position *position, RpStack *search_stack, RpTTProbe table_result, float depth, int upper_bound) {
+static void rpTTStats(Position *position, RpStack *search_stack, RpTTProbe table_result, float depth, int upper_bound)
+{
     int player_side = rpState(position)->side_to_move, opponent_side = player_side ^ 1;
     if (!rpLegal(position, table_result.table_move)) { // 形状が有力でも規則上置けない手は採用できないため、合法性を確認する。
         return;
@@ -2520,7 +2580,8 @@ static void rpTTStats(Position *position, RpStack *search_stack, RpTTProbe table
 }
 
 /* 重複候補で探索時間を浪費しないよう、盤面内の空点だけを一度ずつ追加する。 */
-static void rpAddMove(RpMovePicker *move_picker, Position *position, int padded_position) {
+static void rpAddMove(RpMovePicker *move_picker, Position *position, int padded_position)
+{
     if (!rpInBoard(padded_position) || rpPiece(position, padded_position) != 2 || move_picker->move_count >= BOARD_POINT_COUNT) { // 余白の壁や盤外を着手候補に含めないよう、参照先の範囲を限定する。
         return;
     }
@@ -2533,7 +2594,8 @@ static void rpAddMove(RpMovePicker *move_picker, Position *position, int padded_
 }
 
 /* 相手の活四を通常候補の順位に埋もれさせないよう、線上から必須の防御点を得る。 */
-static void rpFlex4LineDefence(Position *position, int opponent_side, int padded_position, int direction_index, RpMovePicker *move_picker) {
+static void rpFlex4LineDefence(Position *position, int opponent_side, int padded_position, int direction_index, RpMovePicker *move_picker)
+{
     int left_defence_position = 0, right_defence_position = 0;
     rpAddMove(move_picker, position, padded_position); // 重複候補で探索時間を浪費しないよう、盤面内の空点だけを一度ずつ追加する。
     for (int direction_sign = -1; direction_sign <= 1; direction_sign += 2) {
@@ -2563,7 +2625,8 @@ static void rpFlex4LineDefence(Position *position, int opponent_side, int padded
 }
 
 /* 同じ線上の三の進展を見落とさないよう、四を作る防御候補を両側から調べる。 */
-static void rpDoubleB3Defence(Position *position, int opponent_side, int padded_position, RpMovePicker *move_picker) {
+static void rpDoubleB3Defence(Position *position, int opponent_side, int padded_position, RpMovePicker *move_picker)
+{
     rpAddMove(move_picker, position, padded_position); // 重複候補で探索時間を浪費しないよう、盤面内の空点だけを一度ずつ追加する。
     for (int direction_index = 0; direction_index < 4; direction_index++) {
         int element_index, neighbor_position = padded_position;
@@ -2592,7 +2655,8 @@ static void rpDoubleB3Defence(Position *position, int opponent_side, int padded_
 }
 
 /* 強制防御を漏らさないよう、直近の攻撃記録と線形状から活四への応手を復元する。 */
-static void rpFourDefence(Position *position, int include_losing, RpMovePicker *move_picker) {
+static void rpFourDefence(Position *position, int include_losing, RpMovePicker *move_picker)
+{
     int opponent_side = rpState(position)->side_to_move ^ 1, attack = rpState(position)->last_open_four_moves[opponent_side];
     if (attack) {
         for (int direction_index = 0; direction_index < 4; direction_index++) {
@@ -2693,7 +2757,8 @@ static void rpFourDefence(Position *position, int include_losing, RpMovePicker *
 }
 
 /* 合法でない黒の脅威を守る誤りを避けるため、防御表の候補も禁じ手と照合する。 */
-static void rpF3LineDefence(Position *position, int opponent_side, int padded_position, int direction_index, RpMovePicker *move_picker) {
+static void rpF3LineDefence(Position *position, int opponent_side, int padded_position, int direction_index, RpMovePicker *move_picker)
+{
     int index = rpLineIndex(position, padded_position, direction_index, 0);
     int mask;
     if (opponent_side == 0 && !AI_ENABLE_OVERLINE) { // 対局規則に合わせて黒の長連を除外するため、設定と適用条件を確認する。１で有効。
@@ -2751,7 +2816,8 @@ static void rpF3LineDefence(Position *position, int opponent_side, int padded_po
 }
 
 /* 見かけの形状だけで四と断定しないよう、仮着手後に五連完成点ができるか確認する。 */
-static int rpB4InLine(Position *position, int opponent_side, int padded_position, int direction_index) {
+static int rpB4InLine(Position *position, int opponent_side, int padded_position, int direction_index)
+{
     int element_index = 0;
     for (int direction_sign = -1; direction_sign <= 1; direction_sign += 2) {
         int neighbor_position = padded_position, budget = direction_sign < 0 ? 4 : 4 - element_index;
@@ -2790,7 +2856,8 @@ static int rpB4InLine(Position *position, int opponent_side, int padded_position
 }
 
 /* 受けるだけでは間に合わない局面にも対応するため、相手の三に自分の三以上で反撃する候補を得る。 */
-static void rpB3CounterDefence(Position *position, int opponent_side, int padded_position, int direction_index, RpMovePicker *move_picker) {
+static void rpB3CounterDefence(Position *position, int opponent_side, int padded_position, int direction_index, RpMovePicker *move_picker)
+{
     int player_side = opponent_side ^ 1, pseudo = player_side == 0 && rpPattern4(position, padded_position, player_side) == COMBINED_PATTERN_FORBIDDEN;
     for (int direction_sign = -1; direction_sign <= 1; direction_sign += 2) {
         for (int step_index = 1; step_index <= 4; step_index++) {
@@ -2808,7 +2875,8 @@ static void rpB3CounterDefence(Position *position, int opponent_side, int padded
 }
 
 /* 四三への応手を狭めすぎないよう、直接防御と反撃の両方を生成する。 */
-static void rpB4F3Defence(Position *position, RpMovePicker *move_picker) {
+static void rpB4F3Defence(Position *position, RpMovePicker *move_picker)
+{
     int opponent_side = rpState(position)->side_to_move ^ 1, padded_position = rpFindPattern(position, opponent_side, COMBINED_PATTERN_FOUR_THREE, 1);
     if (!padded_position) {
         return;
@@ -2837,7 +2905,8 @@ static void rpB4F3Defence(Position *position, RpMovePicker *move_picker) {
 }
 
 /* 禁じ手や成立しない四三を必須防御と誤認しないよう、相手の候補を仮着手で確かめる。 */
-static int rpValidateOpponentC(Position *position) {
+static int rpValidateOpponentC(Position *position)
+{
     int player_side = rpState(position)->side_to_move;
     if (player_side == 0) {
         return 1;
@@ -2855,7 +2924,8 @@ static int rpValidateOpponentC(Position *position) {
 }
 
 /* 探索順を再現できるよう、同点の候補は座標順で比較する。 */
-static int rpCompareMoves(const void *first_candidate_data, const void *second_candidate_data) {
+static int rpCompareMoves(const void *first_candidate_data, const void *second_candidate_data)
+{
     const RpMove *first_candidate = (const RpMove *)first_candidate_data, *second_candidate = (const RpMove *)second_candidate_data;
     if (first_candidate->ordering_score != second_candidate->ordering_score) {
         return second_candidate->ordering_score - first_candidate->ordering_score;
@@ -2864,7 +2934,8 @@ static int rpCompareMoves(const void *first_candidate_data, const void *second_c
 }
 
 /* 未探索の低得点候補の整列負荷を減らすため、候補数に応じて必要な上位だけを整える。 */
-static void rpPartialSort(RpMovePicker *move_picker) {
+static void rpPartialSort(RpMovePicker *move_picker)
+{
     if (move_picker->move_count <= MOVE_REDUCTION_TABLE_SIZE / 4) {
         int sorted_candidate_count = 0;
         for (int candidate_index = 1; candidate_index < move_picker->move_count; candidate_index++) {
@@ -2885,7 +2956,8 @@ static void rpPartialSort(RpMovePicker *move_picker) {
 }
 
 /* 枝刈りが早く成立する有力手を先に読むため、形状・方策・履歴・応手の得点を合わせる。 */
-static void rpScoreMoves(Position *position, RpMovePicker *move_picker, int use_history, int use_counter, int use_policy) {
+static void rpScoreMoves(Position *position, RpMovePicker *move_picker, int use_history, int use_counter, int use_policy)
+{
     int player_side = rpState(position)->side_to_move, opponent_side = player_side ^ 1;
 #if AI_ENABLE_RAPFI
     float policy_scores[BOARD_POINT_COUNT] = {0};
@@ -2922,7 +2994,8 @@ static void rpScoreMoves(Position *position, RpMovePicker *move_picker, int use_
 }
 
 /* 補助形状付きの四を見落とさないよう、複合形状の四の範囲をまとめて判定する。 */
-static int rpHasFour(Position *position, int padded_position, int player_side, int combination) {
+static int rpHasFour(Position *position, int padded_position, int player_side, int combination)
+{
     int combined_pattern = rpPattern4(position, padded_position, player_side);
     if (combination) {
         return combined_pattern >= COMBINED_PATTERN_CLOSED_FOUR_WITH_SUPPORT;
@@ -2941,7 +3014,8 @@ static int rpHasFour(Position *position, int padded_position, int player_side, i
 }
 
 /* 候補集合の採否を統一するため、現在の探索範囲にある空点から通常候補を生成する。 */
-static void rpGenerateAll(Position *position, RpMovePicker *move_picker) {
+static void rpGenerateAll(Position *position, RpMovePicker *move_picker)
+{
     RpCandidateIterator candidate_iterator = {0};
     int padded_position;
     while ((padded_position = rpNextCandidate(position, &candidate_iterator))) {
@@ -2950,7 +3024,8 @@ static void rpGenerateAll(Position *position, RpMovePicker *move_picker) {
 }
 
 /* 静止探索で攻撃を途中で止めないよう、連続四になる候補を追加する。 */
-static void rpAppendVCF(Position *position, RpMovePicker *move_picker) {
+static void rpAppendVCF(Position *position, RpMovePicker *move_picker)
+{
     int player_side = rpState(position)->side_to_move;
     RpCandidateIterator candidate_iterator = {0};
     int padded_position;
@@ -2962,7 +3037,8 @@ static void rpAppendVCF(Position *position, RpMovePicker *move_picker) {
 }
 
 /* 反撃との重複を避けて探索順を安定させるため、防御候補を選別し座標順へ整える。 */
-static void rpFilterDefence(Position *position, RpMovePicker *move_picker) {
+static void rpFilterDefence(Position *position, RpMovePicker *move_picker)
+{
     int remaining_move_count = 0, player_side = rpState(position)->side_to_move;
     for (int candidate_index = 0; candidate_index < move_picker->move_count; candidate_index++) {
         if (rpPattern4(position, move_picker->moves[candidate_index].padded_position, player_side) < COMBINED_PATTERN_CLOSED_FOUR) {
@@ -2978,7 +3054,8 @@ static void rpFilterDefence(Position *position, RpMovePicker *move_picker) {
 }
 
 /* 脅威に不要な通常候補を生成しないよう、局面と探索種別から列挙の開始段階を選ぶ。 */
-static void rpInitPicker(Position *position, RpMovePicker *move_picker, int tt_move, int is_continuous_four_search, float depth, RpStack *search_stack) {
+static void rpInitPicker(Position *position, RpMovePicker *move_picker, int tt_move, int is_continuous_four_search, float depth, RpStack *search_stack)
+{
     int player_side = rpState(position)->side_to_move, opponent_side = player_side ^ 1, valid = 1;
     memset(move_picker, 0, sizeof(*move_picker)); // 別の枝や前回の処理の値が集計へ混ざらないよう、使用前の状態をそろえる。
     move_picker->depth = depth;
@@ -3009,7 +3086,8 @@ static void rpInitPicker(Position *position, RpMovePicker *move_picker, int tt_m
 }
 
 /* 参考手で探索が終わる場合の負荷を避けるため、防御・反撃・通常手を必要時だけ生成する。 */
-static void rpFillPicker(Position *position, RpMovePicker *move_picker) {
+static void rpFillPicker(Position *position, RpMovePicker *move_picker)
+{
     int player_side = rpState(position)->side_to_move, opponent_side = player_side ^ 1;
     if (move_picker->generation_stage == 4) {
         if (!move_picker->table_move) {
@@ -3058,7 +3136,8 @@ static void rpFillPicker(Position *position, RpMovePicker *move_picker) {
 }
 
 /* 有力な参考手を先に試し無効手を採用しないよう、重複と合法性を確認して次の候補を返す。 */
-static int rpNextMove(Position *position, RpMovePicker *move_picker) {
+static int rpNextMove(Position *position, RpMovePicker *move_picker)
+{
     if (move_picker->table_move_pending) {
         move_picker->table_move_pending = 0;
         return move_picker->table_move;
@@ -3077,7 +3156,8 @@ static int rpNextMove(Position *position, RpMovePicker *move_picker) {
 }
 
 /* 即勝ちと強制防御を優先するため、根の合法候補を脅威別に生成する。 */
-static void rpGenerateRoot(Position *position, RpMovePicker *move_picker) {
+static void rpGenerateRoot(Position *position, RpMovePicker *move_picker)
+{
     int player_side = rpState(position)->side_to_move, opponent_side = player_side ^ 1;
     memset(move_picker, 0, sizeof(*move_picker)); // 別の枝や前回の処理の値が集計へ混ざらないよう、使用前の状態をそろえる。
     if (rpCount(position, player_side, COMBINED_PATTERN_FIVE)) {
@@ -3128,15 +3208,16 @@ static void rpGenerateRoot(Position *position, RpMovePicker *move_picker) {
 }
 
 /* 黒の禁じ手を脅威として数えないよう、形状の集計を必要に応じて合法性で絞る。 */
-static int rpLegalThreatCount(Position *position, int player_side, int pattern_type) {
-    if (player_side != 0) {
+static int rpLegalThreatCount(Position *position, int player_side, int pattern_type)
+{
+    if (player_side != 0 && pattern_type != COMBINED_PATTERN_DOUBLE_OPEN_THREE) {
         return rpCount(position, player_side, pattern_type);
     }
     int element_count = 0;
     for (int board_y = 0; board_y < BOARD_SIZE; board_y++) {
         for (int board_x = 0; board_x < BOARD_SIZE; board_x++) {
             int padded_position = rpPos(board_x, board_y);
-            if (rpPiece(position, padded_position) == 2 && rpPattern4(position, padded_position, player_side) == pattern_type && !isForbiddenBlackMove(position, board_x, board_y)) { // 形状が有力でも規則上置けない手は採用できないため、合法性を確認する。
+            if (rpPiece(position, padded_position) == 2 && rpPattern4(position, padded_position, player_side) == pattern_type && (player_side != 0 || !isForbiddenBlackMove(position, board_x, board_y)) && (pattern_type != COMBINED_PATTERN_DOUBLE_OPEN_THREE || renjuHasTrueDoubleThree(position, board_x, board_y, player_side + 1))) { // 形状が有力でも規則上置けない手は採用できないため、合法性を確認する。
                 element_count++;
             }
         }
@@ -3144,13 +3225,23 @@ static int rpLegalThreatCount(Position *position, int player_side, int pattern_t
     return element_count;
 }
 
-/* 補助形状で分類が変わっても攻撃を見落とさないよう、四を含む候補数をまとめる。 */
-static int rpBlock4Count(Position *position, int player_side) {
-    return rpCount(position, player_side, COMBINED_PATTERN_FOUR_THREE) + rpCount(position, player_side, COMBINED_PATTERN_CLOSED_FOUR_WITH_SUPPORT) + rpCount(position, player_side, COMBINED_PATTERN_CLOSED_FOUR);
+/* 偽三により合法になる四の反撃も調べ、形状集計から漏れた反撃を無視して必勝と断定しない。 */
+static int rpHasLegalFourAttack(Position *position, int player_side)
+{
+    for (int board_y = 0; board_y < BOARD_SIZE; board_y++) {
+        for (int board_x = 0; board_x < BOARD_SIZE; board_x++) {
+            int padded_position = rpPos(board_x, board_y);
+            if (rpPiece(position, padded_position) == 2 && rpHasFour(position, padded_position, player_side, 0) && isLegalMove(position, board_x, board_y, player_side + 1)) {
+                return 1;
+            }
+        }
+    }
+    return 0;
 }
 
 /* 強制的な決着に不要な探索時間を使わないよう、合法な五連・活四・複合脅威から必勝を判定する。 */
-static int rpQuickWin(Position *position, int search_ply, int upper_bound) {
+static int rpQuickWin(Position *position, int search_ply, int upper_bound)
+{
     int player_side = rpState(position)->side_to_move, opponent_side = player_side ^ 1;
     if (rpCount(position, player_side, COMBINED_PATTERN_FIVE) && rpLegalThreatCount(position, player_side, COMBINED_PATTERN_FIVE)) {
         return FORCED_WIN_SCORE - search_ply - 1;
@@ -3167,9 +3258,6 @@ static int rpQuickWin(Position *position, int search_ply, int upper_bound) {
     }
     if (FORCED_WIN_SCORE - search_ply - 5 >= upper_bound) { // 評価窓の外では境界だけが必要なので、確定値と上下限を区別して探索量を抑える。
         if (rpCount(position, player_side, COMBINED_PATTERN_FOUR_THREE)) {
-            if (player_side == 1 && !rpBlock4Count(position, opponent_side)) {
-                return FORCED_WIN_SCORE - search_ply - 5;
-            }
             for (int board_y = 0; board_y < BOARD_SIZE; board_y++) {
                 for (int board_x = 0; board_x < BOARD_SIZE; board_x++) {
                     int padded_position = rpPos(board_x, board_y);
@@ -3179,7 +3267,7 @@ static int rpQuickWin(Position *position, int search_ply, int upper_bound) {
                     rpMake(position, padded_position); // 再帰探索で全盤を再構築しないよう、着手と空手を履歴・形状・候補へ差分反映する。
                     int defend = rpFindPattern(position, player_side, COMBINED_PATTERN_FIVE, 1), combined_pattern = rpPattern4(position, defend, opponent_side);
                     int has_defend = combined_pattern >= COMBINED_PATTERN_CLOSED_FOUR || (combined_pattern == COMBINED_PATTERN_FORBIDDEN && rpInBoard(defend) && !isForbiddenBlackMove(position, rpX(defend), rpY(defend)));
-                    int is_pseudo_threat = rpCount(position, player_side, COMBINED_PATTERN_OPEN_FOUR) == 0;
+                    int is_pseudo_threat = rpLegalThreatCount(position, player_side, COMBINED_PATTERN_OPEN_FOUR) == 0;
                     rpUndo(position); // 兄弟の枝の探索条件を一致させるため、直前の着手・空手と候補情報を復元する。
                     if (!has_defend && !is_pseudo_threat) {
                         return FORCED_WIN_SCORE - search_ply - 5;
@@ -3187,7 +3275,7 @@ static int rpQuickWin(Position *position, int search_ply, int upper_bound) {
                 }
             }
         }
-        if (rpCount(position, player_side, COMBINED_PATTERN_DOUBLE_OPEN_THREE) && !rpCount(position, opponent_side, COMBINED_PATTERN_OPEN_FOUR) && !rpBlock4Count(position, opponent_side) && rpLegalThreatCount(position, player_side, COMBINED_PATTERN_DOUBLE_OPEN_THREE)) {
+        if (rpCount(position, player_side, COMBINED_PATTERN_DOUBLE_OPEN_THREE) && !rpCount(position, opponent_side, COMBINED_PATTERN_OPEN_FOUR) && !rpHasLegalFourAttack(position, opponent_side) && rpLegalThreatCount(position, player_side, COMBINED_PATTERN_DOUBLE_OPEN_THREE)) {
             return FORCED_WIN_SCORE - search_ply - 5;
         }
     }
@@ -3195,7 +3283,8 @@ static int rpQuickWin(Position *position, int search_ply, int upper_bound) {
 }
 
 /* 時計参照の負荷を抑えつつ制限内で返すため、一定の訪問間隔で時間と訪問数を確認する。 */
-static void rpTouchNode(void) {
+static void rpTouchNode(void)
+{
     searched_node_count++;
 #if AI_NODE_LIMIT > 0
     if (searched_node_count >= (uint64_t)AI_NODE_LIMIT) {
@@ -3208,7 +3297,8 @@ static void rpTouchNode(void) {
 }
 
 /* 返却する最善手の根拠を追えるよう、選んだ手と子の主変化をつなぐ。 */
-static void rpUpdatePV(RpStack *search_stack, int move) {
+static void rpUpdatePV(RpStack *search_stack, int move)
+{
     int destination_index = 0, remaining_ply_count = SEARCH_PLY_LIMIT - search_stack->search_ply;
     search_stack->principal_variation_moves[destination_index++] = move;
     for (int child_variation_index = 0; child_variation_index < remaining_ply_count - 1 && (search_stack + 1)->principal_variation_moves[child_variation_index]; child_variation_index++) {
@@ -3221,7 +3311,8 @@ static void rpUpdatePV(RpStack *search_stack, int move) {
 static int rpVCFSearch(Position *position, RpStack *search_stack, int lower_bound, int upper_bound, float depth, int is_principal_variation);
 
 /* 連続四の探索で相手の即勝ちを放置しないよう、五連完成点への強制防御を適用する。 */
-static int rpVCFDefend(Position *position, RpStack *search_stack, int lower_bound, int upper_bound, float depth, int is_principal_variation) {
+static int rpVCFDefend(Position *position, RpStack *search_stack, int lower_bound, int upper_bound, float depth, int is_principal_variation)
+{
 #ifdef AI_ENABLE_SEARCH_TRACE
     fprintf(stderr, "TRACE D %d %d %d %.9g %d\n", search_stack->search_ply, lower_bound, upper_bound, (double)depth, is_principal_variation); // 移植元との探索手順を比較できるよう、検証用の構成だけで経過を記録する。
 #endif
@@ -3257,7 +3348,8 @@ static int rpVCFDefend(Position *position, RpStack *search_stack, int lower_boun
 }
 
 /* 探索の先端で四の応酬を静的評価に埋もれさせないよう、連続四の静止探索を行う。 */
-static int rpVCFSearch(Position *position, RpStack *search_stack, int lower_bound, int upper_bound, float depth, int is_principal_variation) {
+static int rpVCFSearch(Position *position, RpStack *search_stack, int lower_bound, int upper_bound, float depth, int is_principal_variation)
+{
 #ifdef AI_ENABLE_SEARCH_TRACE
     fprintf(stderr, "TRACE Q %d %d %d %.9g %d\n", search_stack->search_ply, lower_bound, upper_bound, (double)depth, is_principal_variation); // 移植元との探索手順を比較できるよう、検証用の構成だけで経過を記録する。
 #endif
@@ -3356,7 +3448,8 @@ static int rpVCFSearch(Position *position, RpStack *search_stack, int lower_boun
 }
 
 /* 移植元と同じ探索配分を保つため、アルファベータ探索の枝刈り・延長・削減・再探索を同じ条件で適用する。 */
-static int rpSearch(Position *position, RpStack *search_stack, int lower_bound, int upper_bound, float depth, int is_cut_node, int node_type) {
+static int rpSearch(Position *position, RpStack *search_stack, int lower_bound, int upper_bound, float depth, int is_cut_node, int node_type)
+{
 #ifdef AI_ENABLE_SEARCH_TRACE
     fprintf(stderr, "TRACE S %d %d %d %.9g %d\n", search_stack->search_ply, lower_bound, upper_bound, (double)depth, node_type != SEARCH_NODE_NON_PRINCIPAL_VARIATION); // 移植元との探索手順を比較できるよう、検証用の構成だけで経過を記録する。
 #endif
@@ -3721,7 +3814,8 @@ static int rpSearch(Position *position, RpStack *search_stack, int lower_bound, 
             counter_move_history[opponent_side][previous_move][1] = own_move_pattern;
         }
     }
-    int value_bound = best_evaluation >= upper_bound ? TABLE_BOUND_LOWER : is_principal_variation && best_move ? TABLE_BOUND_EXACT : TABLE_BOUND_UPPER;
+    int value_bound = best_evaluation >= upper_bound ? TABLE_BOUND_LOWER : is_principal_variation && best_move ? TABLE_BOUND_EXACT
+                                                                                                               : TABLE_BOUND_UPPER;
     if (best_evaluation <= lower_bound) { // 評価窓の外では境界だけが必要なので、確定値と上下限を区別して探索量を抑える。
         search_stack->table_principal_variation = search_stack->table_principal_variation || ((search_stack - 1)->table_principal_variation && depth > 3.0f); // 有力手と強制応手に読みを配分し、低順位の候補には浅い確認から時間を使う。
     }
@@ -3735,7 +3829,8 @@ static int rpSearch(Position *position, RpStack *search_stack, int lower_bound, 
 }
 
 /* 同評価で着手が不必要に入れ替わらないよう、根の候補を評価順に安定整列する。 */
-static void rpSortRoot(int start, int end) {
+static void rpSortRoot(int start, int end)
+{
     for (int candidate_index = start + 1; candidate_index < end; candidate_index++) {
         RpRootMove move = root_candidate_moves[candidate_index];
         int insertion_index = candidate_index;
@@ -3748,7 +3843,8 @@ static void rpSortRoot(int start, int end) {
 }
 
 /* 対称な候補の重複を確認するため、盤面の８種類の回転・反転を内部位置へ適用する。 */
-static int rpTransform(int padded_position, int transform_index) {
+static int rpTransform(int padded_position, int transform_index)
+{
     int board_x = rpX(padded_position), board_y = rpY(padded_position), last_board_coordinate = BOARD_SIZE - 1;
     switch (transform_index) {
     case 1: {
@@ -3779,7 +3875,8 @@ static int rpTransform(int padded_position, int transform_index) {
 }
 
 /* 対称な候補の代表を繰り返し探す負荷を減らすため、集合の経路を圧縮する。 */
-static int rpSetRoot(int *parent, int padded_position) {
+static int rpSetRoot(int *parent, int padded_position)
+{
     while (parent[padded_position] != padded_position) {
         parent[padded_position] = parent[parent[padded_position]];
         padded_position = parent[padded_position];
@@ -3788,7 +3885,8 @@ static int rpSetRoot(int *parent, int padded_position) {
 }
 
 /* 同じ局面になる手へ重複して時間を使わないよう、盤面を保つ変換だけで根の候補をまとめる。 */
-static void rpFilterSymmetry(Position *position, RpMovePicker *move_picker) {
+static void rpFilterSymmetry(Position *position, RpMovePicker *move_picker)
+{
     int parent[1024], sizes[1024];
     if (!AI_ENABLE_ROOT_SYMMETRY) { // 等価な根の候補へ重複して時間を使わないための対称性除去。
         return;
@@ -3841,7 +3939,8 @@ static void rpFilterSymmetry(Position *position, RpMovePicker *move_picker) {
 }
 
 /* 前回評価を使って探索量を抑えつつ大きな変動にも対応するため、狭い窓から必要時に広げる。 */
-static int rpAspiration(Position *position, RpStack *search_stack, int previous_evaluation, float depth) {
+static int rpAspiration(Position *position, RpStack *search_stack, int previous_evaluation, float depth)
+{
     int delta = AI_ASPIRATION_DELTA, lower_bound = -SEARCH_SCORE_INFINITY, upper_bound = SEARCH_SCORE_INFINITY, fail_high_count = 0, search_value = 0;
     if (AI_ENABLE_ASPIRATION && depth >= AI_ASPIRATION_DEPTH) { // 前回評価付近の狭い窓で探索量を減らすため、設定と適用条件を確認する。
         lower_bound = rpMax(previous_evaluation - delta, -SEARCH_SCORE_INFINITY); // 評価窓の外では境界だけが必要なので、確定値と上下限を区別して探索量を抑える。
@@ -3875,7 +3974,8 @@ static int recorded_game_moves[BOARD_POINT_COUNT], recorded_game_colors[BOARD_PO
 static int expected_game_board[BOARD_SIZE][BOARD_SIZE];
 
 /* 対局側の履歴を変更しないよう、外部盤面からＡＩ専用の局面を引き継ぐか再構成する。 */
-static void rpLoadBoard(Position *position, int board[][BOARD_SIZE], int stone) {
+static void rpLoadBoard(Position *position, int board[][BOARD_SIZE], int stone)
+{
     int changed_point_count = 0, new_pos = 0, new_color = 0, has_removed_or_replaced_stone = 0;
     for (int board_y = 0; board_y < BOARD_SIZE; board_y++) { // 盤面・形状集計・局面キーの対応を保ち、差分更新後も全再計算と同じ状態にする。
         for (int board_x = 0; board_x < BOARD_SIZE; board_x++) {
@@ -3926,7 +4026,8 @@ static void rpLoadBoard(Position *position, int board[][BOARD_SIZE], int stone) 
 }
 
 /* 盤端の序盤でも隣接方向を狭めすぎないよう、移植元と同じ正方形へ候補範囲を広げる。 */
-static void rpExpandOpeningCandidates(Position *position) {
+static void rpExpandOpeningCandidates(Position *position)
+{
     RpState *current_state = rpState(position);
     for (int history_index = 0; history_index < recorded_game_move_count; history_index++) {
         int padded_position = recorded_game_moves[history_index], board_x = rpX(padded_position), board_y = rpY(padded_position);
@@ -3952,7 +4053,8 @@ static void rpExpandOpeningCandidates(Position *position) {
 }
 
 /* 入力盤面と対局側の変数を保つため、専用の局面で反復深化して選んだ座標だけを返す。成功は０、失敗は１。 */
-int calcPutPos(int board[][BOARD_SIZE], int computer_stone, int *output_x, int *output_y) {
+int calcPutPos(int board[][BOARD_SIZE], int computer_stone, int *output_x, int *output_y)
+{
     if (output_x) {
         *output_x = -1;
     }

@@ -1,168 +1,94 @@
-// 五目並べ（連珠）先手は黒で(7,7)に置く
-// 3種類の禁じ手のどれをルールとするかは，check変数でコンパイル時に指定する．
-// 禁じ手のルールは，これらのサイトを見て作ったつもり．
-//  http://iroha.poloa.net/ref/02_04.html
-//  https://ja.wikipedia.org/wiki/%E4%BA%94%E7%9B%AE%E4%B8%A6%E3%81%B9
+//=========================================================================
+// 五目並べ（連珠）共通ライブラリ：勝敗判定・禁じ手判定
+//
+// 禁じ手は連珠の公式ルール（日本連珠社／RIF）の定義に従って判定する．
+//   五　　：同色の石がちょうど5つ連続した形
+//           （check に CHOLEN が含まれるとき，黒の6つ以上の連続は五ではない）
+//   長連　：6つ以上の連続
+//   四　　：あと1手で五になる形
+//   達四　：五になる点が2つある四（・●●●●・）
+//   三　　：あと1手で達四になる形．
+//           ただし，達四を作るその1手が禁じ手になる場合は三とみなさない（偽の三）
+//   四四　：1手で四を2つ以上作る手．1本のライン上に2つの四ができる形
+//           （●・●●●・● や ●●・●●・●● の中央）も含む
+//   三三　：1手で三を2つ以上作る手（四三三，四四三などを含む）
+// 黒が五を作った場合は，同時に禁じ手の形ができていても黒の勝ちとする．
+// 黒石が置かれるたびに，その石が作った三・四（三連・飛び三・四連・飛び四）を表示する．
+// 白に禁じ手はなく，白は五以上（長連を含む）で勝ち．
+// 有効にする禁じ手は gomoku.c の大域変数 check で切り替える．
+//
+// 禁じ手の判定は「直前に置かれた石」についてのみ行う．
+// gameEndProcess の引数 c33Board は直前の盤面の記録に使う
+// （gomoku.c の gameInit で 0 クリアされるので，対局開始時は空盤面となる）．
+// c44Board は引数の互換性のために残しているが使用しない．
+//=========================================================================
 
 #include "gomoku.h"
 
-#include <stdbool.h>
 #include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <time.h>
 
-int gameEndProcess(int board[][BOARD_SIZE],int c33Board[][BOARD_SIZE],int c44Board[][BOARD_SIZE]);
+int gameEndProcess(int board[][BOARD_SIZE], int c33Board[][BOARD_SIZE],
+                   int c44Board[][BOARD_SIZE]);
 int lenCheck(int board[][BOARD_SIZE], int x, int y);
 int isSan(int board[][BOARD_SIZE], int x, int y);
 int isShi(int board[][BOARD_SIZE], int x, int y);
 int isRoku(int board[][BOARD_SIZE], int x, int y);
+int isForbidden(int board[][BOARD_SIZE], int x, int y);
 
-//int check = 7;  // 1:三三のみ 2:四四のみ 4:長連のみ 3:三三と四四 5:三三と長連
-                // 6:四四と長連 7:全部
-int gTobiShi =0;
-int lTobiShi;
+// 方向 0:[─] 1:[│] 2:[＼] 3:[／]
+static const int DX[4] = {1, 0, 1, 1};
+static const int DY[4] = {0, 1, 1, -1};
+
+static int judgeBlack(int board[][BOARD_SIZE], int x, int y);
 
 //-------------------------------------------------
-// 距離計算
+// (x,y) の状態．盤外なら -1
 //-------------------------------------------------
-int distance(int x, int y, int nx, int ny) {
-    int distance = -1; 
-    if (x==nx) distance = abs(y-ny);
-    if (y==ny) distance = abs(x-nx);
-    if ((x!=nx)&&(y!=ny)&&(abs(x-nx)==abs(y-ny))) distance = abs(x-nx);
-    return distance;
+static int cellAt(int board[][BOARD_SIZE], int x, int y) {
+    return checkOutPos(x, y) ? board[y][x] : -1;
 }
 
 //-------------------------------------------------
-// ゲーム終了判定処理
+// (x,y) の石を含む，方向 d に連続する同色の石の範囲を
+// (x,y) からのオフセット [*lo, *hi] で返す
 //-------------------------------------------------
-int gameEndProcess(int board[][BOARD_SIZE],int c33Board[][BOARD_SIZE],int c44Board[][BOARD_SIZE]) {
-    int i, j;
-    int n_san = 0;
-    int n_shi = 0;
-    int num;
-
-    int tmp_x =0;
-    int tmp_y =0;
-
-    lTobiShi =0;
-        
-   for(i = 0; i < BOARD_SIZE; i++) {
-        for(j = 0; j < BOARD_SIZE; j++) {
-            if(board[i][j] == STONE_SPACE) {
-                continue;
-            }
-            if((check & CHOLEN) && board[i][j] == STONE_BLACK &&
-               (isRoku(board, j, i) == true)) {
-                printf("長連の禁じ手です。%sの勝ちです\n", "○");
-                return 1;
-            }
-        }}
-    
-   for(i = 0; i < BOARD_SIZE; i++) {
-        for(j = 0; j < BOARD_SIZE; j++) {
-            if(board[i][j] == STONE_SPACE) {
-                continue;
-            }
-            if(lenCheck(board, j, i)) {
-                printf("%sの勝ちです。\n",
-                       (board[i][j] == STONE_BLACK) ? "●" : "○");
-                return 1;
-            }
-        }}
-
-    for(i = 0; i < BOARD_SIZE; i++) {
-        for(j = 0; j < BOARD_SIZE; j++) {
-            if(board[i][j] == STONE_SPACE) {
-                continue;
-            }
-            if((check & SANSAN) && board[i][j] == STONE_BLACK &&
-               (num = isSan(board, j, i))) {
-                //printf("33num:%d\n", num);
-                if((num>0)&&(c33Board[i][j]==0)&&(num!=LEFT)&&(num!=TATE)&&(num!=YOKO)&&(num!=RIGT)){
-                    //printf("33 i=%d j=%d c33Board[i][j]=%d\n", i,j,c33Board[i][j]);
-                    printf("三三の禁じ手です。%sの勝ちです\n", "○");
-                    return 1;}
-                if((num > 0)&&(c33Board[i][j]!=num)&&(n_san == 0)){
-                    tmp_x=j;tmp_y=i;
-                    n_san++;
-                    c33Board[i][j]=num;
-                    //printf("33 i=%d j=%d c33Board[i][j]=%d\n", i,j,c33Board[i][j]);
-                };
-                 if((num > 0)&&(n_san > 0)&&(c33Board[i][j]!=num)) {
-                     //printf("33num-2:%d\n", num);
-                     //printf("i=%d j=%d c33Board[i][j]=%d\n", i ,j, c33Board[i][j]);
-                    c33Board[i][j]=num;
-                    n_san++;
-                    c33Board[i][j]=num;
-                    if (c33Board[tmp_y][tmp_x]!=c33Board[i][j]){
-                     printf("三三の禁じ手です。%sの勝ちです\n", "○");
-                     return 1;}
-                 }
-            
-            }
-
-            if((check & SHISHI) && board[i][j] == STONE_BLACK &&
-               (num = isShi(board, j, i))) {
-                //printf("44num:%d\n", num);
-                if((num>0)&&(c44Board[i][j]==0)&&(num!=LEFT)&&(num!=TATE)&&(num!=YOKO)&&(num!=RIGT)){
-                    //printf("44num-0:%d\n", num);
-                    printf("四四の禁じ手です。%sの勝ちです\n", "○");
-                    return 1;}
-                if((num > 0)&&(c44Board[i][j]!=num)&&(n_shi == 0)){
-                    tmp_x=j;tmp_y=i;
-                    n_shi++;
-                    c44Board[i][j]=num;
-                    //printf("44num-1:%d\n", num);
-                };
-                 if((num > 0)&&(n_shi > 0)&&(c44Board[i][j]!=num)) {
-                    c44Board[i][j]=num;                     
-                    n_shi++;
-                    c44Board[i][j]=num;
-                    //printf("44num-2:%d\n", num);
-                    //printf("44 tmp_y=%d tmp_x=%d c44Board[tmp_y][tmp_x]=%d\n", tmp_y,tmp_x,c44Board[tmp_y][tmp_x]);
-                    //printf("44 i=%d j=%d c44Board[i][j]=%d\n", i,j,c44Board[i][j]);
-                    if (c44Board[tmp_y][tmp_x]!=c44Board[i][j]){
-                     printf("四四の禁じ手です。%sの勝ちです\n", "○");
-                     return 1;} else if (distance(tmp_y,tmp_x,i,j)>2){
-                     printf("四四の禁じ手です。%sの勝ちです\n", "○");
-                     return 1;}
-                 }
-            }
-        }
+static void runRange(int board[][BOARD_SIZE], int x, int y, int d, int *lo,
+                     int *hi) {
+    int color = board[y][x];
+    int k;
+    for (k = 1; cellAt(board, x - k * DX[d], y - k * DY[d]) == color; k++) {
+        // 同じ色の石が続く間 k を進めるだけ（ループ本体の処理はない）
     }
-    //printf("lTobiShi:%d\n", lTobiShi);
-    //printf("gTobiShi:%d\n", gTobiShi);
-    if (lTobiShi - gTobiShi >1){
-    printf("四四の禁じ手です。%sの勝ちです\n", "○");    
-    return 1;}
-    gTobiShi = lTobiShi;
-    //if (lTobiShi2 >1){
-    //printf("四四の禁じ手です。%sの勝ちです\n", "○");    
-    //return 1;}
-    return 0;
+    *lo = 1 - k;
+    for (k = 1; cellAt(board, x + k * DX[d], y + k * DY[d]) == color; k++) {
+        // 同じ色の石が続く間 k を進めるだけ（ループ本体の処理はない）
+    }
+    *hi = k - 1;
+}
+
+static int runLength(int board[][BOARD_SIZE], int x, int y, int d) {
+    int lo, hi;
+    runRange(board, x, y, d, &lo, &hi);
+    return hi - lo + 1;
 }
 
 //-------------------------------------------------
-// 5連確認
+// 連続数 len が color にとって「五（勝ち）」かどうか
 //-------------------------------------------------
-int lenCheck(int board[][BOARD_SIZE], int x, int y) {
-    int i, j, len_flag;
-    int dx[] = {1, 0, 1, -1};
-    int dy[] = {1, 1, 0, 1};
+static int isFiveLength(int color, int len) {
+    if (color == STONE_BLACK && (check & CHOLEN)) {
+        return len == 5; // 黒は長連が禁じ手のとき，ちょうど5つだけが五
+    }
+    return len >= 5;
+}
 
-    // i    0:[＼]方向 1:[│]方向 2:[─]方向 3:[／]方向
-
-    for(i = 0; i < 4; i++) {
-        for(j = 0, len_flag = 1; j < 5; j++) {
-            if(!checkOutPos(x + j * dx[i], y + j * dy[i]) ||
-               board[y][x] != board[y + j * dy[i]][x + j * dx[i]]) {
-                len_flag = 0;
-                break;
-            }
-        }
-        if(len_flag == 1) {
+//-------------------------------------------------
+// (x,y) の石が五を作っているか
+//-------------------------------------------------
+static int makesFive(int board[][BOARD_SIZE], int x, int y) {
+    int d;
+    for (d = 0; d < 4; d++) {
+        if (isFiveLength(board[y][x], runLength(board, x, y, d))) {
             return 1;
         }
     }
@@ -170,176 +96,380 @@ int lenCheck(int board[][BOARD_SIZE], int x, int y) {
 }
 
 //-------------------------------------------------
-// 三 を見つける
+// 方向 d 上で，石を1つ足すと (x,y) の石を含む五ができる空点を探す．
+// 見つかった空点の (x,y) からのオフセットを昇順で pts に入れ，個数を返す
 //-------------------------------------------------
-int isSan(int board[][BOARD_SIZE], int x, int y) {
-    int i, j;
-    int dx[] = {1, 0, 1, -1};
-    int dy[] = {1, 1, 0, 1};
-    int sum_stone = 0;
-    int sum_space = 0;
-    int num = 0;
-
-    // i    0:[＼]方向 1:[│]方向 2:[─]方向 3:[／]方向
-
-    for(i = 0; i < 4; i++) {
-        sum_stone = 0;
-        sum_space = 0;
-        // 左側が空で，４つの連続するマスの3つが石で残り１つが空で右端も空か，3連続するマスの３つが石で，右端も空
-        if(!checkOutPos(x - dx[i], y - dy[i]) ||
-           (checkOutPos(x - dx[i], y - dy[i]) &&
-            board[y - dy[i]][x - dx[i]] != STONE_SPACE)) {
-            // 左側が空でないか，盤の外
+static int fivePointsInDir(int board[][BOARD_SIZE], int x, int y, int d,
+                           int pts[]) {
+    int color = board[y][x];
+    int n = 0;
+    int k, lo, hi;
+    for (k = -4; k <= 4; k++) {
+        int qx = x + k * DX[d];
+        int qy = y + k * DY[d];
+        if (k == 0 || cellAt(board, qx, qy) != STONE_SPACE) {
             continue;
         }
-        for(j = 0; j < 4; j++) {
-            // printf("%d (%d %d) %d (%d %d) \n", board[y][x], x, y, board[y + j
-            // * dy[i]][x + j * dx[i]], x + j * dx[i], y + j * dy[i]);
-            if(checkOutPos(x + j * dx[i], y + j * dy[i])) {
-                if(board[y][x] == board[y + j * dy[i]][x + j * dx[i]]) {
-                    sum_stone++;
-                    if(sum_stone == 3)  // 3連続
-                        break;
-                } else if(board[y + j * dy[i]][x + j * dx[i]] ==
-                          STONE_SPACE)  // 飛び三の可能性あり
-                {
-                    sum_space++;
-                } else {  // 違う色の石がある
-                    break;
+        board[qy][qx] = color; // 仮に置く
+        runRange(board, x, y, d, &lo, &hi);
+        if (lo <= k && k <= hi && isFiveLength(color, hi - lo + 1)) {
+            pts[n++] = k;
+        }
+        board[qy][qx] = STONE_SPACE; // 元に戻す
+    }
+    return n;
+}
+
+//-------------------------------------------------
+// 方向 d 上で (x,y) の石を含む四の数
+//   五になる点が2つあり，間隔が5なら同じ4石による達四なので1つと数える．
+//   それ以外（●・●●●・● など）は別々の四なので点の数だけ数える
+//-------------------------------------------------
+static int foursInDir(int board[][BOARD_SIZE], int x, int y, int d) {
+    int pts[8];
+    int n = fivePointsInDir(board, x, y, d, pts);
+    if (n == 2 && pts[1] - pts[0] == 5) {
+        return 1;
+    }
+    return n;
+}
+
+//-------------------------------------------------
+// 方向 d 上で (x,y) の石が達四の一部になっているか
+//-------------------------------------------------
+static int isStraightFourInDir(int board[][BOARD_SIZE], int x, int y, int d) {
+    int pts[8];
+    int n = fivePointsInDir(board, x, y, d, pts);
+    return n == 2 && pts[1] - pts[0] == 5;
+}
+
+//-------------------------------------------------
+// 方向 d 上で (x,y) の石が三になっているか
+//   空点に1つ置くと (x,y) を含む達四ができ，かつその手が禁じ手でないなら三．
+//   同じ方向にすでに四があれば，その方向は三とは数えない
+//-------------------------------------------------
+static int threeInDir(int board[][BOARD_SIZE], int x, int y, int d) {
+    int color = board[y][x];
+    int k, lo, hi, ok;
+    if (foursInDir(board, x, y, d) > 0) {
+        return 0;
+    }
+    for (k = -4; k <= 4; k++) {
+        int qx = x + k * DX[d];
+        int qy = y + k * DY[d];
+        if (k == 0 || cellAt(board, qx, qy) != STONE_SPACE) {
+            continue;
+        }
+        board[qy][qx] = color; // 仮に置く
+        ok = 0;
+        if (isStraightFourInDir(board, x, y, d)) {
+            runRange(board, x, y, d, &lo, &hi);
+            if (lo <= k && k <= hi) {
+                // 達四を作る手そのものが禁じ手なら偽の三（黒のみ）
+                ok = (color != STONE_BLACK) ||
+                     (judgeBlack(board, qx, qy) == NOKINJITE);
+            }
+        }
+        board[qy][qx] = STONE_SPACE; // 元に戻す
+        if (ok) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+//-------------------------------------------------
+// (x,y) に置かれた黒石が禁じ手かどうか（石は置いた状態で呼ぶ）
+//   戻り値 NOKINJITE / CHOLEN / SHISHI / SANSAN
+//   check で無効になっている禁じ手は判定しない
+//-------------------------------------------------
+static int judgeBlack(int board[][BOARD_SIZE], int x, int y) {
+    int d, n;
+
+    if (makesFive(board, x, y)) {
+        return NOKINJITE; // 五ができれば禁じ手より優先
+    }
+
+    if (check & CHOLEN) {
+        for (d = 0; d < 4; d++) {
+            if (runLength(board, x, y, d) >= 6) {
+                return CHOLEN;
+            }
+        }
+    }
+    if (check & SHISHI) {
+        for (d = 0, n = 0; d < 4; d++) {
+            n += foursInDir(board, x, y, d);
+        }
+        if (n >= 2) {
+            return SHISHI;
+        }
+    }
+    if (check & SANSAN) {
+        for (d = 0, n = 0; d < 4 && n < 2; d++) {
+            n += threeInDir(board, x, y, d);
+        }
+        if (n >= 2) {
+            return SANSAN;
+        }
+    }
+    return NOKINJITE;
+}
+
+//-------------------------------------------------
+// 方向 d 上で，オフセット [lo, hi] の範囲（skip を除く）にある石のうち，
+// 盤面の上（同じ行なら左）にある石の座標を返す．形の表示位置に使う
+//-------------------------------------------------
+static void firstStone(int x, int y, int d, int lo, int hi, int skip, int *sx,
+                       int *sy) {
+    int k, first = 1;
+    for (k = lo; k <= hi; k++) {
+        int cx = x + k * DX[d];
+        int cy = y + k * DY[d];
+        if (k == skip) {
+            continue;
+        }
+        if (first || cy < *sy || (cy == *sy && cx < *sx)) {
+            *sx = cx;
+            *sy = cy;
+            first = 0;
+        }
+    }
+}
+
+//-------------------------------------------------
+// (x,y) に置かれた石が作った三・四を表示する
+//   四連：4つ連続した四      飛び四：間に1つ空きのある四
+//   三連：3つ連続した三      飛び三：間に1つ空きのある三
+//   座標は形の端の石（上側，同じ行なら左側）
+//   三は check に SANSAN，四は check に SHISHI が含まれるときに表示する
+//-------------------------------------------------
+static void printShapes(int board[][BOARD_SIZE], int x, int y) {
+    int color = board[y][x];
+    int d, i, k, lo, hi, sx = x, sy = y;
+    int pts[8], n;
+
+    for (d = 0; d < 4; d++) {
+        n = fivePointsInDir(board, x, y, d, pts);
+        if (n > 0) {
+            if (!(check & SHISHI)) {
+                continue;
+            }
+            if (n == 2 && pts[1] - pts[0] == 5) {
+                // 達四：・●●●●・
+                runRange(board, x, y, d, &lo, &hi);
+                firstStone(x, y, d, lo, hi, 99, &sx, &sy);
+                printf("四連(%d %d)\n", sx, sy);
+                continue;
+            }
+            for (i = 0; i < n; i++) {
+                k = pts[i];
+                // 五になる点に仮に置く
+                board[y + k * DY[d]][x + k * DX[d]] = color;
+                runRange(board, x, y, d, &lo, &hi);
+                board[y + k * DY[d]][x + k * DX[d]] = STONE_SPACE;
+                // 長連が勝ちになる設定で6連以上になる場合は，
+                // (x,y) と k を含む5マスに絞る
+                if (lo < k - 4) {
+                    lo = k - 4;
+                }
+                if (hi > k + 4) {
+                    hi = k + 4;
+                }
+                if (lo < -4) {
+                    lo = -4;
+                }
+                if (hi > 4) {
+                    hi = 4;
+                }
+                firstStone(x, y, d, lo, hi, k, &sx, &sy);
+                printf("%s(%d %d)\n", (k == lo || k == hi) ? "四連" : "飛び四",
+                       sx, sy);
+            }
+            continue;
+        }
+
+        if (!(check & SANSAN)) {
+            continue;
+        }
+        // 三：達四を作れる点（禁じ手でないもの）を探す．端に置いて達四になるなら三連
+        {
+            int found = 0, renzoku = 0;
+            int flo = 0, fhi = 0, fk = 0;
+            for (k = -4; k <= 4 && !renzoku; k++) {
+                int qx = x + k * DX[d];
+                int qy = y + k * DY[d];
+                int ok = 0;
+                if (k == 0 || cellAt(board, qx, qy) != STONE_SPACE) {
+                    continue;
+                }
+                board[qy][qx] = color;
+                if (isStraightFourInDir(board, x, y, d)) {
+                    runRange(board, x, y, d, &lo, &hi);
+                    ok = lo <= k && k <= hi &&
+                         ((color != STONE_BLACK) ||
+                          (judgeBlack(board, qx, qy) == NOKINJITE));
+                }
+                board[qy][qx] = STONE_SPACE;
+                if (ok) {
+                    found = 1;
+                    flo = lo;
+                    fhi = hi;
+                    fk = k;
+                    renzoku = (k == lo || k == hi);
                 }
             }
-        }
-        // printf("%d %d sum_stone %d sum_space %d (%d %d)\n", i, j, sum_stone,
-        // sum_space, board[y][x], board[y + j * dy[i]][x + j * dx[i]]);
-
-        if(sum_stone == 3 && sum_space == 1) {
-            // 右が空なら
-            if(checkOutPos(x + 4 * dx[i], y + 4 * dy[i]) &&
-               board[y + 4 * dy[i]][x + 4 * dx[i]] == STONE_SPACE) {
-            switch(i){
-            case 0: num += LEFT; break;
-            case 1: num += TATE; break;
-            case 2: num += YOKO; break;
-            case 3: num += RIGT; break;
-            }
-
-                printf("飛び三(%d %d)\n", x, y);
-                //飛び三
-                //num++;
-            }
-        } else if(sum_stone == 3 && sum_space == 0) {
-            // 右が空なら
-            if(checkOutPos(x + 3 * dx[i], y + 3 * dy[i]) &&
-               board[y + 3 * dy[i]][x + 3 * dx[i]] == STONE_SPACE) {
-                // 3連続
-            switch(i){
-            case 0: num += LEFT; break;
-            case 1: num += TATE; break;
-            case 2: num += YOKO; break;
-            case 3: num += RIGT; break;
-            }
-                printf("三連(%d %d)\n", x, y);
+            if (found) {
+                firstStone(x, y, d, flo, fhi, fk, &sx, &sy);
+                printf("%s(%d %d)\n", renzoku ? "三連" : "飛び三", sx, sy);
             }
         }
     }
-    return num;
+}
+
+//=========================================================================
+// 以下は外部から呼べる関数
+//=========================================================================
+
+//-------------------------------------------------
+// 空点 (x,y) に黒を置いたら禁じ手になるか（盤面は変更しない）
+//   戻り値 NOKINJITE(0) / CHOLEN / SHISHI / SANSAN
+//   AI から候補手のチェックに使える．
+//   使う場合は extern int isForbidden(int board[][BOARD_SIZE], int x, int y);
+//   を宣言すること
+//-------------------------------------------------
+int isForbidden(int board[][BOARD_SIZE], int x, int y) {
+    int r;
+    if (!checkOutPos(x, y) || board[y][x] != STONE_SPACE) {
+        return NOKINJITE;
+    }
+    board[y][x] = STONE_BLACK;
+    r = judgeBlack(board, x, y);
+    board[y][x] = STONE_SPACE;
+    return r;
 }
 
 //-------------------------------------------------
-// 四 を見つける
+// ゲーム終了判定処理
+//   直前に置かれた石について，五（勝ち）と禁じ手を判定する
+//   戻り値 勝負がついたとき 1，それ以外 0
+//-------------------------------------------------
+int gameEndProcess(int board[][BOARD_SIZE], int c33Board[][BOARD_SIZE],
+                   int c44Board[][BOARD_SIZE]) {
+    int (*prev)[BOARD_SIZE] = c33Board; // 直前の盤面
+    int x, y, kind;
+    int result = 0;
+    int n_empty = 0;
+    (void)c44Board;
+
+    for (y = 0; y < BOARD_SIZE; y++) {
+        for (x = 0; x < BOARD_SIZE; x++) {
+            if (board[y][x] == STONE_SPACE) {
+                n_empty++;
+                continue;
+            }
+            if (result || board[y][x] == prev[y][x]) {
+                continue;
+            }
+
+            // 新しく置かれた石
+            if (makesFive(board, x, y)) {
+                printf("%sの勝ちです。\n",
+                       (board[y][x] == STONE_BLACK) ? "●" : "○");
+                result = 1;
+                continue;
+            }
+            if (board[y][x] == STONE_BLACK) {
+                printShapes(board, x, y); // 置いた石が作った三・四を表示
+            }
+            if (board[y][x] == STONE_BLACK &&
+                (kind = judgeBlack(board, x, y)) != NOKINJITE) {
+                switch (kind) {
+                case CHOLEN:
+                    printf("長連の禁じ手です。%sの勝ちです\n", "○");
+                    break;
+                case SHISHI:
+                    printf("四四の禁じ手です。%sの勝ちです\n", "○");
+                    break;
+                case SANSAN:
+                    printf("三三の禁じ手です。%sの勝ちです\n", "○");
+                    break;
+                }
+                result = 1;
+            }
+        }
+    }
+
+    // 直前の盤面を更新
+    for (y = 0; y < BOARD_SIZE; y++) {
+        for (x = 0; x < BOARD_SIZE; x++) {
+            prev[y][x] = board[y][x];
+        }
+    }
+
+    if (!result && n_empty == 0) {
+        printf("引き分けです。\n");
+        result = 1;
+    }
+    return result;
+}
+
+//-------------------------------------------------
+// 5連確認
+//   (x,y) の石を含む五ができていれば 1
+//   （check に CHOLEN が含まれるとき，黒の長連は五ではないので 0）
+//-------------------------------------------------
+int lenCheck(int board[][BOARD_SIZE], int x, int y) {
+    if (!checkOutPos(x, y) || board[y][x] == STONE_SPACE) {
+        return 0;
+    }
+    return makesFive(board, x, y);
+}
+
+//-------------------------------------------------
+// 三の確認
+//   (x,y) の石を含む三の数（三になっている方向の数）を返す．三がなければ 0
+//-------------------------------------------------
+int isSan(int board[][BOARD_SIZE], int x, int y) {
+    int d, n = 0;
+    if (!checkOutPos(x, y) || board[y][x] == STONE_SPACE) {
+        return 0;
+    }
+    for (d = 0; d < 4; d++) {
+        n += threeInDir(board, x, y, d);
+    }
+    return n;
+}
+
+//-------------------------------------------------
+// 四の確認
+//   (x,y) の石を含む四の数を返す（1ライン上に2つある場合は2と数える）．
+//   四がなければ 0
 //-------------------------------------------------
 int isShi(int board[][BOARD_SIZE], int x, int y) {
-    int i, j;
-    int dx[] = {1, 0, 1, -1};
-    int dy[] = {1, 1, 0, 1};
-    int sum_stone = 0;
-    int sum_space = 0;
-    int num = 0;
-
-    // i    0:[＼:1]方向 1:[│:2]方向 2:[─:5]方向 3:[／:9]方向
-
-    for(i = 0; i < 4; i++) {
-        sum_stone = 0;
-        sum_space = 0;
-        // ５つの連続するマスの４つが石で残り１つが空か４つの連続するマスの４つが石で，両端のどちらかに石がない
-        for(j = 0; j < 5; j++) {
-            if(checkOutPos(x + j * dx[i], y + j * dy[i])) {
-                if(board[y][x] == board[y + j * dy[i]][x + j * dx[i]]) {
-                    sum_stone++;
-                    if(sum_stone == 4) break;
-                } else if(board[y + j * dy[i]][x + j * dx[i]] ==
-                          STONE_SPACE) {  // 飛び四の可能性あり
-                    sum_space++;
-                } else  // 違う色の石がある
-                    break;
-            }
-        }
-        if(sum_stone == 4 && sum_space == 1) {
-            // 飛び四
-            switch(i){
-            case 0: num += LEFT; break;
-            case 1: num += TATE; break;
-            case 2: num += YOKO; break;
-            case 3: num += RIGT; break;
-            }
-            //num++;
-            lTobiShi++;
-            printf("飛び四(%d %d)\n", x, y);
-        } else if(sum_stone == 4 && sum_space == 0) {
-            //４連
-            if((checkOutPos(x - dx[i], y - dy[i]) &&
-                board[y - dy[i]][x - dx[i]] == STONE_SPACE) ||
-               (checkOutPos(x + 4 * dx[i], y + 4 * dy[i]) &&
-                board[y + 4 * dy[i]][x + 4 * dx[i]] == STONE_SPACE)) {
-            switch(i){
-            case 0: num += LEFT; break;
-            case 1: num += TATE; break;
-            case 2: num += YOKO; break;
-            case 3: num += RIGT; break;
-            }
-                printf("四連(%d %d)\n", x, y);
-            }
-        }
+    int d, n = 0;
+    if (!checkOutPos(x, y) || board[y][x] == STONE_SPACE) {
+        return 0;
     }
-    return num;
+    for (d = 0; d < 4; d++) {
+        n += foursInDir(board, x, y, d);
+    }
+    return n;
 }
 
 //-------------------------------------------------
-// ６連続を見つける
+// 6連（長連）の確認
+//   (x,y) の石を含む6つ以上の連続があれば 1
 //-------------------------------------------------
 int isRoku(int board[][BOARD_SIZE], int x, int y) {
-    int i, j;
-    int dx[] = {1, 0, 1, -1};
-    int dy[] = {1, 1, 0, 1};
-    int sum_stone = 0;
-    int sum_space = 0;
-
-    // i    0:[＼]方向 1:[│]方向 2:[─]方向 3:[／]方向
-    for(i = 0; i < 4; i++) {
-        sum_space = 0;
-        sum_stone = 0;
-
-        // 6つの連続するマスの6つが石
-        for(j = 0; j < 6; j++) {
-            if(checkOutPos(x + j * dx[i], y + j * dy[i])) {
-                if(board[y][x] == board[y + j * dy[i]][x + j * dx[i]]) {
-                    sum_stone++;
-                    if(sum_stone == 6) {
-                        return true;
-                    }
-                    /* ルール間違えてた．．．
-                    if(sum_stone == 5 &&
-                       sum_space == 1) {  //
-                    ６つの連続するマスのうち，5個に石あり return true;
-                    }
-                    */
-                } else if(board[y + j * dy[i]][x + j * dx[i]] ==
-                          STONE_SPACE) {  // 可能性あり
-                    sum_space++;
-                } else  // 違う色の石がある
-                    break;
-            }
+    int d;
+    if (!checkOutPos(x, y) || board[y][x] == STONE_SPACE) {
+        return 0;
+    }
+    for (d = 0; d < 4; d++) {
+        if (runLength(board, x, y, d) >= 6) {
+            return 1;
         }
     }
-    return false;
+    return 0;
 }
